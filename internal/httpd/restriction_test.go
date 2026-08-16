@@ -357,6 +357,95 @@ func TestListRestrictions_FilterAndStats(t *testing.T) {
 	}
 }
 
+// restrictionCheckAudits collects all restriction.check audit-log entries via
+// the audit-logs endpoint.
+func restrictionCheckAudits(t *testing.T, h http.Handler) []*model.AuditLog {
+	t.Helper()
+	_, ad := doJSON(t, h, http.MethodGet, "/api/v1/audit-logs?entity_type=restriction", nil)
+	var aenv struct {
+		Data struct {
+			Items []*model.AuditLog `json:"items"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(ad, &aenv); err != nil {
+		t.Fatalf("unmarshal audit logs: %v: %s", err, string(ad))
+	}
+	var out []*model.AuditLog
+	for _, l := range aenv.Data.Items {
+		if l.Action == "restriction.check" {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// TestCreateAuthorization_NormalPassageAudited is the regression test for the
+// missing restriction.check audit entry. When an authorization is created for
+// a plate that is NOT on the restriction list, the restriction check still ran
+// (and passed) — that "normal passage" outcome must be recorded in the audit
+// log so the restriction-check trail is complete, not only the denial cases.
+func TestCreateAuthorization_NormalPassageAudited(t *testing.T) {
+	h, _ := newServer(t, 0)
+	area := mustAreaHTTP(t, h, 5)
+	res := mustResidentHTTP(t, h, "1栋")
+	from := baseTime()
+	start := from.Add(time.Hour)
+	end := start.Add(5 * time.Hour)
+	resp, data := doJSON(t, h, http.MethodPost, "/api/v1/authorizations", authBody(area, res, "京X12345", start, end))
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create auth status=%d body=%s", resp.StatusCode, string(data))
+	}
+	audits := restrictionCheckAudits(t, h)
+	var found bool
+	for _, l := range audits {
+		if strings.Contains(l.Detail, "京X12345") && strings.Contains(l.Detail, "allowed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a restriction.check audit log recording normal passage for 京X12345, got %+v", audits)
+	}
+}
+
+// TestEntry_NormalPassageAudited is the regression test for the missing
+// restriction.check audit entry at vehicle entry. Entering a vehicle whose plate
+// is not on the restriction list is a normal passage and must be audited just
+// like the forbidden/manual-confirm cases.
+func TestEntry_NormalPassageAudited(t *testing.T) {
+	h, _ := newServer(t, 0)
+	area := mustAreaHTTP(t, h, 5)
+	res := mustResidentHTTP(t, h, "1栋")
+	from := baseTime()
+	// Window covers `now` (=baseTime) so entry at the fixed clock is valid.
+	start := from
+	end := from.Add(5 * time.Hour)
+	resp, data := doJSON(t, h, http.MethodPost, "/api/v1/authorizations", authBody(area, res, "京Y12345", start, end))
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create auth status=%d body=%s", resp.StatusCode, string(data))
+	}
+	var env struct {
+		Data *model.Authorization `json:"data"`
+	}
+	json.Unmarshal(data, &env)
+	if env.Data == nil {
+		t.Fatalf("create auth body: %s", string(data))
+	}
+	resp, data = doJSON(t, h, http.MethodPost, "/api/v1/authorizations/"+env.Data.ID+"/entry", nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("entry status=%d body=%s", resp.StatusCode, string(data))
+	}
+	audits := restrictionCheckAudits(t, h)
+	var found bool
+	for _, l := range audits {
+		if strings.Contains(l.Detail, "京Y12345") && strings.Contains(l.Detail, "allowed") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected a restriction.check audit log recording normal passage for 京Y12345, got %+v", audits)
+	}
+}
+
 // TestRestrictionOverlap_Concurrent verifies the overlap guard is race-free:
 // many goroutines try to create an overlapping active restriction for the same
 // plate/window; exactly one must succeed.

@@ -18,9 +18,16 @@ type EntryRequest struct {
 
 // auditRestrictionCheck records the outcome of a restriction-list check that ran
 // during authorization creation or vehicle entry. It is best-effort: audit-log
-// write failures are ignored. Only invoked when a restriction was matched.
+// write failures are ignored. It is always invoked — including the normal-passage
+// case where no active restriction matched — so the restriction-check audit trail
+// is complete. When no restriction matched but the surrounding operation failed
+// for an unrelated reason (e.g. resident disabled, area archived, no capacity),
+// there is no meaningful restriction outcome to record, so nothing is written.
 func (s *Service) auditRestrictionCheck(ctx context.Context, scope, plate, operator string, r *model.VehicleRestriction, confirmer string, err error) {
 	if r == nil {
+		if err == nil {
+			s.audit(ctx, "restriction.check", "restriction", "", operator, fmt.Sprintf("%s: plate %s no active restriction, allowed", scope, plate))
+		}
 		return
 	}
 	var detail string

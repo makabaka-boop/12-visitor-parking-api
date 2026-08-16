@@ -183,7 +183,11 @@ func (p *Postgres) ListVehicleRestrictions(ctx context.Context, f model.Restrict
 	var total int64
 	for rows.Next() {
 		r := &model.VehicleRestriction{}
-		if err := scanRestriction(rows, r); err != nil {
+		// The query prepends count(*) OVER() to restrictionCols, so the first
+		// scanned column is the window total and the rest are the struct fields.
+		// Inlining the scan (rather than scanRestriction) keeps the destination
+		// count aligned with the 12 selected columns.
+		if err := rows.Scan(&total, &r.ID, &r.Plate, &r.Type, &r.EffectiveFrom, &r.EffectiveTo, &r.Reason, &r.RegisteredBy, &r.Status, &r.ArchivedAt, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, 0, err
 		}
 		out = append(out, r)
