@@ -520,7 +520,7 @@ func (p *Postgres) ExitVehicle(ctx context.Context, authID string, now time.Time
 		// Fee generation within the same transaction as the exit and capacity
 		// release. Look up the rule effective at entry time; if none, skip.
 		rule := &model.BillingRule{}
-		err := scanBillingRule(p.q(ctx).QueryRowContext(ctx, `SELECT `+billingRuleCols+` FROM billing_rules WHERE parking_area_id=$1 AND archived_at IS NULL AND effective_from <= $2 ORDER BY effective_from DESC LIMIT 1`, areaID, entryTime), rule)
+		err := scanBillingRule(p.q(ctx).QueryRowContext(ctx, `SELECT `+billingRuleCols+` FROM billing_rules WHERE parking_area_id=$1 AND effective_from <= $2 AND (archived_at IS NULL OR archived_at > $2) ORDER BY effective_from DESC LIMIT 1`, areaID, entryTime), rule)
 		if err == nil {
 			charged, amount := ComputeFee(entryTime, now, rule.FreeMinutes, rule.HourlyRateCents, rule.DailyCapCents)
 			fee = &model.Fee{
@@ -599,9 +599,9 @@ func (p *Postgres) GetBillingRule(ctx context.Context, id string) (*model.Billin
 	err := scanBillingRule(p.q(ctx).QueryRowContext(ctx, `SELECT `+billingRuleCols+` FROM billing_rules WHERE id=$1 AND archived_at IS NULL`, id), r)
 	return r, mapNotFound(err)
 }
-func (p *Postgres) UpdateBillingRule(ctx context.Context, r *model.BillingRule) error {
+func (p *Postgres) UpdateBillingRule(ctx context.Context, r *model.BillingRule, expectedUpdatedAt time.Time) error {
 	res, err := p.q(ctx).ExecContext(ctx, `UPDATE billing_rules SET free_minutes=$1,hourly_rate_cents=$2,daily_cap_cents=$3,effective_from=$4,status=$5,updated_at=$6 WHERE id=$7 AND archived_at IS NULL AND updated_at=$8`,
-		r.FreeMinutes, r.HourlyRateCents, r.DailyCapCents, r.EffectiveFrom, r.Status, r.UpdatedAt, r.ID, r.UpdatedAt)
+		r.FreeMinutes, r.HourlyRateCents, r.DailyCapCents, r.EffectiveFrom, r.Status, r.UpdatedAt, r.ID, expectedUpdatedAt)
 	if err != nil && isUniqueViolation(err) {
 		return ErrConflict
 	}
@@ -649,7 +649,7 @@ func (p *Postgres) ListBillingRules(ctx context.Context, f BillingRuleFilter) ([
 }
 func (p *Postgres) ActiveBillingRule(ctx context.Context, areaID string, at time.Time) (*model.BillingRule, error) {
 	r := &model.BillingRule{}
-	err := scanBillingRule(p.q(ctx).QueryRowContext(ctx, `SELECT `+billingRuleCols+` FROM billing_rules WHERE parking_area_id=$1 AND archived_at IS NULL AND effective_from <= $2 ORDER BY effective_from DESC LIMIT 1`, areaID, at), r)
+	err := scanBillingRule(p.q(ctx).QueryRowContext(ctx, `SELECT `+billingRuleCols+` FROM billing_rules WHERE parking_area_id=$1 AND effective_from <= $2 AND (archived_at IS NULL OR archived_at > $2) ORDER BY effective_from DESC LIMIT 1`, areaID, at), r)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil // no applicable rule
 	}

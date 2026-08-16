@@ -607,6 +607,7 @@ func (s *Service) UpdateBillingRule(ctx context.Context, id string, in UpdateBil
 	if !in.UpdatedAt.Equal(cur.UpdatedAt) {
 		return nil, store.ErrConcurrentModify
 	}
+	expectedUpdatedAt := cur.UpdatedAt
 	if in.FreeMinutes != nil {
 		cur.FreeMinutes = *in.FreeMinutes
 	}
@@ -623,7 +624,7 @@ func (s *Service) UpdateBillingRule(ctx context.Context, id string, in UpdateBil
 		return nil, err
 	}
 	cur.UpdatedAt = s.nowT()
-	if err := s.store.UpdateBillingRule(ctx, cur); err != nil {
+	if err := s.store.UpdateBillingRule(ctx, cur, expectedUpdatedAt); err != nil {
 		return nil, err
 	}
 	s.audit(ctx, "billing_rule.update", "billing_rule", id, "system", "billing rule updated")

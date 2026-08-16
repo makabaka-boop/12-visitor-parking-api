@@ -336,6 +336,7 @@ func TestBillingRule_CRUD(t *testing.T) {
 	// update (optimistic, requires updated_at)
 	_, data = doJSON(t, h, http.MethodGet, "/api/v1/billing-rules/"+ruleID, nil)
 	json.Unmarshal(data, &env)
+	advance(clk, time.Second)
 	resp, data = doJSON(t, h, http.MethodPut, "/api/v1/billing-rules/"+ruleID, map[string]interface{}{
 		"hourly_rate_cents": 900,
 		"updated_at":        env.Data.UpdatedAt.Format(time.RFC3339Nano),
@@ -366,6 +367,57 @@ func TestBillingRule_CRUD(t *testing.T) {
 		t.Fatalf("get archived status=%d want 404", resp.StatusCode)
 	}
 	_ = clk
+}
+
+func TestBilling_ArchivedAfterEntryRuleStillGeneratesFee(t *testing.T) {
+	h, _, clk := newClockServer(t)
+	area := mustAreaHTTP(t, h, 5)
+	ruleID := mustBillingRuleHTTP(t, h, area, 0, 500, 4000)
+	res := mustResidentHTTP(t, h, "1栋")
+	start := *clk
+	_, data := doJSON(t, h, http.MethodPost, "/api/v1/authorizations", map[string]interface{}{
+		"resident_id": res, "parking_area_id": area, "plate": "京A12345",
+		"start_time": start.Format(time.RFC3339), "end_time": start.Add(48 * time.Hour).Format(time.RFC3339),
+	})
+	var authEnv struct {
+		Data *model.Authorization `json:"data"`
+	}
+	json.Unmarshal(data, &authEnv)
+	resp, data := doJSON(t, h, http.MethodPost, "/api/v1/authorizations/"+authEnv.Data.ID+"/entry", nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("entry status=%d body=%s", resp.StatusCode, string(data))
+	}
+
+	advance(clk, time.Hour)
+	resp, data = doJSON(t, h, http.MethodDelete, "/api/v1/billing-rules/"+ruleID, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("archive rule status=%d body=%s", resp.StatusCode, string(data))
+	}
+	advance(clk, time.Hour)
+	resp, data = doJSON(t, h, http.MethodPost, "/api/v1/authorizations/"+authEnv.Data.ID+"/exit",
+		map[string]interface{}{"operator": "guard1"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("exit status=%d body=%s", resp.StatusCode, string(data))
+	}
+	var exitEnv struct {
+		Data *model.EntryExitRecord `json:"data"`
+	}
+	json.Unmarshal(data, &exitEnv)
+
+	_, data = doJSON(t, h, http.MethodGet, "/api/v1/fees?record_id="+exitEnv.Data.ID, nil)
+	var feeEnv struct {
+		Data struct {
+			Items []*model.Fee `json:"items"`
+			Total int          `json:"total"`
+		} `json:"data"`
+	}
+	json.Unmarshal(data, &feeEnv)
+	if feeEnv.Data.Total != 1 || len(feeEnv.Data.Items) != 1 {
+		t.Fatalf("expected fee from entry-time rule, got %s", string(data))
+	}
+	if feeEnv.Data.Items[0].BillingRuleID != ruleID || feeEnv.Data.Items[0].AmountCents != 1000 {
+		t.Fatalf("fee = %+v, want rule %s and amount 1000", feeEnv.Data.Items[0], ruleID)
+	}
 }
 
 func TestBillingRule_ValidationErrors(t *testing.T) {

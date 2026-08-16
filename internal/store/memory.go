@@ -621,14 +621,14 @@ func (m *Memory) GetBillingRule(ctx context.Context, id string) (*model.BillingR
 	}
 	return cloneRule(r), nil
 }
-func (m *Memory) UpdateBillingRule(ctx context.Context, r *model.BillingRule) error {
+func (m *Memory) UpdateBillingRule(ctx context.Context, r *model.BillingRule, expectedUpdatedAt time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cur, ok := m.rules[r.ID]
 	if !ok || cur.ArchivedAt != nil {
 		return ErrNotFound
 	}
-	if !cur.UpdatedAt.Equal(r.UpdatedAt) {
+	if !cur.UpdatedAt.Equal(expectedUpdatedAt) {
 		return ErrConcurrentModify
 	}
 	if cur.EffectiveFrom.Equal(r.EffectiveFrom) {
@@ -685,7 +685,10 @@ func (m *Memory) ListBillingRules(ctx context.Context, f BillingRuleFilter) ([]*
 func (m *Memory) activeBillingRuleLocked(areaID string, at time.Time) (*model.BillingRule, error) {
 	var best *model.BillingRule
 	for _, r := range m.rules {
-		if r.ArchivedAt != nil || r.ParkingAreaID != areaID {
+		if r.ParkingAreaID != areaID {
+			continue
+		}
+		if r.ArchivedAt != nil && !r.ArchivedAt.After(at) {
 			continue
 		}
 		if r.EffectiveFrom.After(at) {

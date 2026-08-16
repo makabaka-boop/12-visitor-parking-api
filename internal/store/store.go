@@ -79,12 +79,11 @@ type Store interface {
 	AreaOccupancy(ctx context.Context) ([]*model.AreaOccupancy, error)
 	CreateBillingRule(ctx context.Context, r *model.BillingRule) error
 	GetBillingRule(ctx context.Context, id string) (*model.BillingRule, error)
-	UpdateBillingRule(ctx context.Context, r *model.BillingRule) error // optimistic lock via updated_at
+	UpdateBillingRule(ctx context.Context, r *model.BillingRule, expectedUpdatedAt time.Time) error
 	ArchiveBillingRule(ctx context.Context, id string, now time.Time) error
 	ListBillingRules(ctx context.Context, f BillingRuleFilter) ([]*model.BillingRule, int64, error)
-	// ActiveBillingRule returns the rule effective for areaID at time at (the
-	// latest non-archived rule with effective_from <= at), or (nil, nil) when
-	// no such rule exists.
+	// ActiveBillingRule returns the rule effective for areaID at time at. Rules
+	// archived after at remain eligible because they were active at that time.
 	ActiveBillingRule(ctx context.Context, areaID string, at time.Time) (*model.BillingRule, error)
 	CreateFee(ctx context.Context, f *model.Fee) error
 	GetFee(ctx context.Context, id string) (*model.Fee, error)
