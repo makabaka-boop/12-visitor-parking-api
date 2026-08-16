@@ -178,6 +178,45 @@ func TestCreateAuthorization_ManualConfirmRequiresConfirmer(t *testing.T) {
 	}
 }
 
+func TestRestriction_NoMatchChecksAreAudited(t *testing.T) {
+	h, _ := newServer(t, 0)
+	area := mustAreaHTTP(t, h, 5)
+	res := mustResidentHTTP(t, h, "1栋")
+	start := baseTime()
+	resp, data := doJSON(t, h, http.MethodPost, "/api/v1/authorizations",
+		authBody(area, res, "京K11111", start, start.Add(5*time.Hour)))
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create authorization status=%d body=%s", resp.StatusCode, string(data))
+	}
+	var authEnv struct {
+		Data *model.Authorization `json:"data"`
+	}
+	json.Unmarshal(data, &authEnv)
+	resp, data = doJSON(t, h, http.MethodPost, "/api/v1/authorizations/"+authEnv.Data.ID+"/entry", nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("entry status=%d body=%s", resp.StatusCode, string(data))
+	}
+
+	_, data = doJSON(t, h, http.MethodGet, "/api/v1/audit-logs?entity_type=restriction", nil)
+	var auditEnv struct {
+		Data struct {
+			Items []*model.AuditLog `json:"items"`
+		} `json:"data"`
+	}
+	json.Unmarshal(data, &auditEnv)
+	var authorizationCheck, entryCheck bool
+	for _, log := range auditEnv.Data.Items {
+		if log.Action != "restriction.check" || !strings.Contains(log.Detail, "no active restriction matched, allowed") {
+			continue
+		}
+		authorizationCheck = authorizationCheck || strings.HasPrefix(log.Detail, "authorization.create:")
+		entryCheck = entryCheck || strings.HasPrefix(log.Detail, "entry:")
+	}
+	if !authorizationCheck || !entryCheck {
+		t.Fatalf("missing no-match restriction checks (authorization=%v entry=%v): %s", authorizationCheck, entryCheck, string(data))
+	}
+}
+
 func TestEntry_RestrictionEnforced(t *testing.T) {
 	// Clock is fixed at baseTime(). To exercise the entry-time restriction
 	// check we first create an authorization whose window covers `now` (so the

@@ -18,23 +18,28 @@ type EntryRequest struct {
 
 // auditRestrictionCheck records the outcome of a restriction-list check that ran
 // during authorization creation or vehicle entry. It is best-effort: audit-log
-// write failures are ignored. Only invoked when a restriction was matched.
+// write failures are ignored. Successful checks with no match are also logged
+// so the audit trail records every authorization/entry restriction decision.
 func (s *Service) auditRestrictionCheck(ctx context.Context, scope, plate, operator string, r *model.VehicleRestriction, confirmer string, err error) {
-	if r == nil {
-		return
-	}
 	var detail string
+	entityID := plate
 	switch {
+	case r == nil:
+		detail = fmt.Sprintf("%s: plate %s no active restriction matched, allowed", scope, plate)
 	case errors.Is(err, store.ErrPlateForbidden):
+		entityID = r.ID
 		detail = fmt.Sprintf("%s: plate %s forbidden by restriction %s, denied", scope, plate, r.ID)
 	case errors.Is(err, store.ErrManualConfirmRequired):
+		entityID = r.ID
 		detail = fmt.Sprintf("%s: plate %s requires manual confirmation (restriction %s), confirmer missing", scope, plate, r.ID)
 	case r.Type == model.RestrictionTypeManualConfirm:
+		entityID = r.ID
 		detail = fmt.Sprintf("%s: plate %s manual-confirmed by %s against restriction %s", scope, plate, confirmer, r.ID)
 	default:
+		entityID = r.ID
 		detail = fmt.Sprintf("%s: plate %s restriction %s checked", scope, plate, r.ID)
 	}
-	s.audit(ctx, "restriction.check", "restriction", r.ID, operator, detail)
+	s.audit(ctx, "restriction.check", "restriction", entityID, operator, detail)
 }
 
 // CreateRestrictionInput is the request body for creating a vehicle restriction.

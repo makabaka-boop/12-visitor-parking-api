@@ -317,7 +317,7 @@ func (s *Service) CreateAuthorization(ctx context.Context, in CreateAuthorizatio
 		UpdatedAt:     now,
 	}
 	matched, err := s.store.CreateAuthorization(ctx, a, now, strings.TrimSpace(in.Confirmer))
-	if matched != nil {
+	if matched != nil || err == nil {
 		s.auditRestrictionCheck(ctx, "authorization.create", a.Plate, defStr(strings.TrimSpace(in.Confirmer), a.CreatedBy), matched, strings.TrimSpace(in.Confirmer), err)
 	}
 	if err != nil {
@@ -421,7 +421,7 @@ func (s *Service) EnterVehicle(ctx context.Context, authID, confirmer string) (*
 	now := s.nowT()
 	confirmer = strings.TrimSpace(confirmer)
 	rec, matched, err := s.store.EnterVehicle(ctx, authID, now, confirmer)
-	if matched != nil {
+	if matched != nil || err == nil {
 		plate := ""
 		if rec != nil {
 			plate = rec.Plate

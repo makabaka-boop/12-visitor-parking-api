@@ -68,3 +68,7 @@ const restrictionCols = "id,plate,type,effective_from,effective_to,reason,regist
 func scanRestriction(s scanner, r *model.VehicleRestriction) error {
 	return s.Scan(&r.ID, &r.Plate, &r.Type, &r.EffectiveFrom, &r.EffectiveTo, &r.Reason, &r.RegisteredBy, &r.Status, &r.ArchivedAt, &r.CreatedAt, &r.UpdatedAt)
 }
+
+func scanRestrictionPageRow(s scanner, total *int64, r *model.VehicleRestriction) error {
+	return s.Scan(total, &r.ID, &r.Plate, &r.Type, &r.EffectiveFrom, &r.EffectiveTo, &r.Reason, &r.RegisteredBy, &r.Status, &r.ArchivedAt, &r.CreatedAt, &r.UpdatedAt)
+}

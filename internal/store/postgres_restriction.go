@@ -183,7 +183,7 @@ func (p *Postgres) ListVehicleRestrictions(ctx context.Context, f model.Restrict
 	var total int64
 	for rows.Next() {
 		r := &model.VehicleRestriction{}
-		if err := scanRestriction(rows, r); err != nil {
+		if err := scanRestrictionPageRow(rows, &total, r); err != nil {
 			return nil, 0, err
 		}
 		out = append(out, r)
