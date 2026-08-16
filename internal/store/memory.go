@@ -125,16 +125,19 @@ func (m *Memory) GetResident(ctx context.Context, id string) (*model.Resident, e
 	}
 	return cloneResident(r), nil
 }
-func (m *Memory) UpdateResident(ctx context.Context, r *model.Resident) error {
+func (m *Memory) UpdateResident(ctx context.Context, r *model.Resident, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cur, ok := m.residents[r.ID]
 	if !ok || cur.ArchivedAt != nil {
 		return ErrNotFound
 	}
+	// r.UpdatedAt is the version token the caller read; compare it against the
+	// currently stored value, then advance the version to now.
 	if !cur.UpdatedAt.Equal(r.UpdatedAt) {
 		return ErrConcurrentModify
 	}
+	r.UpdatedAt = now
 	m.residents[r.ID] = cloneResident(r)
 	return nil
 }
@@ -190,7 +193,7 @@ func (m *Memory) GetVehicleByPlate(ctx context.Context, plate string) (*model.Ve
 	}
 	return nil, ErrNotFound
 }
-func (m *Memory) UpdateVehicle(ctx context.Context, v *model.Vehicle) error {
+func (m *Memory) UpdateVehicle(ctx context.Context, v *model.Vehicle, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cur, ok := m.vehicles[v.ID]
@@ -200,6 +203,7 @@ func (m *Memory) UpdateVehicle(ctx context.Context, v *model.Vehicle) error {
 	if !cur.UpdatedAt.Equal(v.UpdatedAt) {
 		return ErrConcurrentModify
 	}
+	v.UpdatedAt = now
 	m.vehicles[v.ID] = cloneVehicle(v)
 	return nil
 }
@@ -245,7 +249,7 @@ func (m *Memory) GetParkingArea(ctx context.Context, id string) (*model.ParkingA
 	}
 	return cloneArea(a), nil
 }
-func (m *Memory) UpdateParkingArea(ctx context.Context, a *model.ParkingArea) error {
+func (m *Memory) UpdateParkingArea(ctx context.Context, a *model.ParkingArea, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cur, ok := m.areas[a.ID]
@@ -255,6 +259,7 @@ func (m *Memory) UpdateParkingArea(ctx context.Context, a *model.ParkingArea) er
 	if !cur.UpdatedAt.Equal(a.UpdatedAt) {
 		return ErrConcurrentModify
 	}
+	a.UpdatedAt = now
 	m.areas[a.ID] = cloneArea(a)
 	return nil
 }
@@ -319,7 +324,7 @@ func (m *Memory) GetAuthorization(ctx context.Context, id string) (*model.Author
 	}
 	return cloneAuth(a), nil
 }
-func (m *Memory) UpdateAuthorization(ctx context.Context, a *model.Authorization) error {
+func (m *Memory) UpdateAuthorization(ctx context.Context, a *model.Authorization, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cur, ok := m.auths[a.ID]
@@ -329,6 +334,7 @@ func (m *Memory) UpdateAuthorization(ctx context.Context, a *model.Authorization
 	if !cur.UpdatedAt.Equal(a.UpdatedAt) {
 		return ErrConcurrentModify
 	}
+	a.UpdatedAt = now
 	m.auths[a.ID] = cloneAuth(a)
 	return nil
 }
@@ -621,7 +627,7 @@ func (m *Memory) GetBillingRule(ctx context.Context, id string) (*model.BillingR
 	}
 	return cloneRule(r), nil
 }
-func (m *Memory) UpdateBillingRule(ctx context.Context, r *model.BillingRule) error {
+func (m *Memory) UpdateBillingRule(ctx context.Context, r *model.BillingRule, now time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cur, ok := m.rules[r.ID]
@@ -643,6 +649,7 @@ func (m *Memory) UpdateBillingRule(ctx context.Context, r *model.BillingRule) er
 			}
 		}
 	}
+	r.UpdatedAt = now
 	m.rules[r.ID] = cloneRule(r)
 	return nil
 }
@@ -680,12 +687,22 @@ func (m *Memory) ListBillingRules(ctx context.Context, f BillingRuleFilter) ([]*
 	return pageOf(out, f.Page), int64(len(out)), nil
 }
 
-// activeBillingRuleLocked returns the effective rule for the area at time at,
-// or (nil, nil) when none applies. Caller must hold m.mu.
+// activeBillingRuleLocked returns the rule effective for the area at time at,
+// or (nil, nil) when none applies. A rule that was archived after `at` is still
+// considered, because it was in effect at `at`; only a rule archived at or
+// before `at` (i.e. no longer active at `at`) is skipped. This lets the exit
+// flow bill against the historical rule that was effective at entry time even
+// when that rule has since been archived. Caller must hold m.mu.
 func (m *Memory) activeBillingRuleLocked(areaID string, at time.Time) (*model.BillingRule, error) {
 	var best *model.BillingRule
 	for _, r := range m.rules {
-		if r.ArchivedAt != nil || r.ParkingAreaID != areaID {
+		if r.ParkingAreaID != areaID {
+			continue
+		}
+		// Skip rules that were already archived at or before `at`: they were
+		// not in effect at `at`. A rule archived after `at` (or still active)
+		// remains eligible.
+		if r.ArchivedAt != nil && !r.ArchivedAt.After(at) {
 			continue
 		}
 		if r.EffectiveFrom.After(at) {

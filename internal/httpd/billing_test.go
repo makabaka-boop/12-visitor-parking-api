@@ -539,6 +539,102 @@ func TestSettleFee_ConcurrentOnlyOneWins(t *testing.T) {
 	}
 }
 
+// TestBillingRule_UpdateAdvancingClock reproduces the false-positive 409 on a
+// normal billing-rule update when the clock advances between the read and the
+// write (as a real wall clock always does). The fixed-clock tests cannot expose
+// this because the newly generated updated_at happens to equal the stored one.
+func TestBillingRule_UpdateAdvancingClock(t *testing.T) {
+	h, _, clk := newClockServer(t)
+	area := mustAreaHTTP(t, h, 5)
+	ruleID := mustBillingRuleHTTP(t, h, area, 15, 800, 5000)
+	// Read the rule to obtain its updated_at concurrency token.
+	_, data := doJSON(t, h, http.MethodGet, "/api/v1/billing-rules/"+ruleID, nil)
+	var env struct {
+		Data *model.BillingRule `json:"data"`
+	}
+	if err := json.Unmarshal(data, &env); err != nil || env.Data == nil {
+		t.Fatalf("get rule: %s", string(data))
+	}
+	// A real wall clock advances between requests; simulate that here. The
+	// token we hold is still the latest one the client read, so a normal
+	// update must succeed rather than be misjudged as a concurrent modification.
+	advance(clk, time.Minute)
+	resp, data := doJSON(t, h, http.MethodPut, "/api/v1/billing-rules/"+ruleID, map[string]interface{}{
+		"hourly_rate_cents": 900,
+		"updated_at":        env.Data.UpdatedAt.Format(time.RFC3339Nano),
+	})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("normal update under advancing clock status=%d want 200 body=%s", resp.StatusCode, string(data))
+	}
+	var updated struct {
+		Data *model.BillingRule `json:"data"`
+	}
+	if err := json.Unmarshal(data, &updated); err != nil || updated.Data == nil {
+		t.Fatalf("update body: %s", string(data))
+	}
+	if updated.Data.HourlyRateCents != 900 {
+		t.Fatalf("rate=%d want 900", updated.Data.HourlyRateCents)
+	}
+}
+
+// TestBilling_ExitAfterRuleArchived reproduces the missing-fee bug: when the
+// billing rule effective at entry is archived before exit, the exit flow must
+// still bill against that historical rule. Filtering out archived rules
+// entirely causes no fee to be generated.
+func TestBilling_ExitAfterRuleArchived(t *testing.T) {
+	h, _, clk := newClockServer(t)
+	area := mustAreaHTTP(t, h, 5)
+	ruleID := mustBillingRuleHTTP(t, h, area, 30, 500, 4000)
+	res := mustResidentHTTP(t, h, "1栋")
+	start := *clk
+	end := start.Add(48 * time.Hour)
+	_, data := doJSON(t, h, http.MethodPost, "/api/v1/authorizations", map[string]interface{}{
+		"resident_id": res, "parking_area_id": area, "plate": "京A12345",
+		"start_time": start.Format(time.RFC3339), "end_time": end.Format(time.RFC3339),
+		"created_by": "staff1",
+	})
+	var authEnv struct {
+		Data *model.Authorization `json:"data"`
+	}
+	if err := json.Unmarshal(data, &authEnv); err != nil || authEnv.Data == nil {
+		t.Fatalf("create auth: %s", string(data))
+	}
+	doJSON(t, h, http.MethodPost, "/api/v1/authorizations/"+authEnv.Data.ID+"/entry", nil)
+	// The rule effective at entry is archived before exit. Exit must still
+	// bill against that historical rule.
+	advance(clk, time.Minute)
+	resp, _ := doJSON(t, h, http.MethodDelete, "/api/v1/billing-rules/"+ruleID, nil)
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("archive rule status=%d want 204", resp.StatusCode)
+	}
+	advance(clk, 2*time.Hour)
+	_, edata := doJSON(t, h, http.MethodPost, "/api/v1/authorizations/"+authEnv.Data.ID+"/exit",
+		map[string]interface{}{"operator": "guard1", "note": "rule archived meanwhile"})
+	var exitEnv struct {
+		Data *model.EntryExitRecord `json:"data"`
+	}
+	if err := json.Unmarshal(edata, &exitEnv); err != nil || exitEnv.Data == nil {
+		t.Fatalf("exit: %s", string(edata))
+	}
+	_, fdata := doJSON(t, h, http.MethodGet, "/api/v1/fees?record_id="+exitEnv.Data.ID, nil)
+	var feeEnv struct {
+		Data struct {
+			Items []*model.Fee `json:"items"`
+			Total int          `json:"total"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(fdata, &feeEnv); err != nil {
+		t.Fatalf("list fees: %s", string(fdata))
+	}
+	if feeEnv.Data.Total != 1 || len(feeEnv.Data.Items) != 1 {
+		t.Fatalf("expected 1 fee for archived-but-effective rule, got %s", string(fdata))
+	}
+	// 2h dwell, 30min free -> 90 billable -> ceil 2h -> 2*500 = 1000
+	if feeEnv.Data.Items[0].AmountCents != 1000 {
+		t.Fatalf("amount=%d want 1000", feeEnv.Data.Items[0].AmountCents)
+	}
+}
+
 func TestBilling_ExitReleasesCapacity(t *testing.T) {
 	h, _, clk := newClockServer(t)
 	area := mustAreaHTTP(t, h, 1) // capacity 1

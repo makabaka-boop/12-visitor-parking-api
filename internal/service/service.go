@@ -119,8 +119,7 @@ func (s *Service) UpdateResident(ctx context.Context, id string, in UpdateReside
 	if in.Status != "" {
 		cur.Status = in.Status
 	}
-	cur.UpdatedAt = now
-	if err := s.store.UpdateResident(ctx, cur); err != nil {
+	if err := s.store.UpdateResident(ctx, cur, now); err != nil {
 		return nil, err
 	}
 	s.audit(ctx, "resident.update", "resident", id, "system", "resident updated")
@@ -198,8 +197,7 @@ func (s *Service) UpdateVehicle(ctx context.Context, id string, v *model.Vehicle
 	if v.Plate != "" {
 		cur.Plate = v.Plate
 	}
-	cur.UpdatedAt = s.nowT()
-	if err := s.store.UpdateVehicle(ctx, cur); err != nil {
+	if err := s.store.UpdateVehicle(ctx, cur, s.nowT()); err != nil {
 		return nil, err
 	}
 	s.audit(ctx, "vehicle.update", "vehicle", id, "system", "vehicle updated")
@@ -270,8 +268,7 @@ func (s *Service) UpdateParkingArea(ctx context.Context, id string, in *model.Pa
 	if in.Capacity > 0 {
 		cur.Capacity = in.Capacity
 	}
-	cur.UpdatedAt = s.nowT()
-	if err := s.store.UpdateParkingArea(ctx, cur); err != nil {
+	if err := s.store.UpdateParkingArea(ctx, cur, s.nowT()); err != nil {
 		return nil, err
 	}
 	s.audit(ctx, "area.update", "parking_area", id, "system", "parking area updated")
@@ -373,8 +370,7 @@ func (s *Service) UpdateAuthorization(ctx context.Context, id string, in *model.
 	if in.ParkingAreaID != "" {
 		cur.ParkingAreaID = in.ParkingAreaID
 	}
-	cur.UpdatedAt = now
-	if err := s.store.UpdateAuthorization(ctx, cur); err != nil {
+	if err := s.store.UpdateAuthorization(ctx, cur, now); err != nil {
 		return nil, err
 	}
 	s.audit(ctx, "authorization.update", "authorization", id, "system", "authorization updated")
@@ -622,8 +618,7 @@ func (s *Service) UpdateBillingRule(ctx context.Context, id string, in UpdateBil
 	if err := validateBillingRuleFields(cur.FreeMinutes, cur.HourlyRateCents, cur.DailyCapCents); err != nil {
 		return nil, err
 	}
-	cur.UpdatedAt = s.nowT()
-	if err := s.store.UpdateBillingRule(ctx, cur); err != nil {
+	if err := s.store.UpdateBillingRule(ctx, cur, s.nowT()); err != nil {
 		return nil, err
 	}
 	s.audit(ctx, "billing_rule.update", "billing_rule", id, "system", "billing rule updated")

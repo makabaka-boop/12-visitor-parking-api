@@ -118,9 +118,12 @@ func (p *Postgres) GetResident(ctx context.Context, id string) (*model.Resident,
 	err := scanResident(p.q(ctx).QueryRowContext(ctx, `SELECT `+residentCols+` FROM residents WHERE id=$1 AND archived_at IS NULL`, id), r)
 	return r, mapNotFound(err)
 }
-func (p *Postgres) UpdateResident(ctx context.Context, r *model.Resident) error {
+func (p *Postgres) UpdateResident(ctx context.Context, r *model.Resident, now time.Time) error {
 	res, err := p.q(ctx).ExecContext(ctx, `UPDATE residents SET name=$1,phone=$2,building=$3,unit=$4,room=$5,status=$6,updated_at=$7 WHERE id=$8 AND archived_at IS NULL AND updated_at=$9`,
-		r.Name, r.Phone, r.Building, r.Unit, r.Room, r.Status, r.UpdatedAt, r.ID, r.UpdatedAt)
+		r.Name, r.Phone, r.Building, r.Unit, r.Room, r.Status, now, r.ID, r.UpdatedAt)
+	if err == nil {
+		r.UpdatedAt = now
+	}
 	return wrap(res, err, ErrConcurrentModify)
 }
 func (p *Postgres) ArchiveResident(ctx context.Context, id string, now time.Time) error {
@@ -173,9 +176,12 @@ func (p *Postgres) GetVehicleByPlate(ctx context.Context, plate string) (*model.
 	err := scanVehicle(p.q(ctx).QueryRowContext(ctx, `SELECT `+vehicleCols+` FROM vehicles WHERE plate=$1 AND archived_at IS NULL`, plate), v)
 	return v, mapNotFound(err)
 }
-func (p *Postgres) UpdateVehicle(ctx context.Context, v *model.Vehicle) error {
+func (p *Postgres) UpdateVehicle(ctx context.Context, v *model.Vehicle, now time.Time) error {
 	res, err := p.q(ctx).ExecContext(ctx, `UPDATE vehicles SET owner_name=$1,owner_phone=$2,color=$3,plate=$4,updated_at=$5 WHERE id=$6 AND archived_at IS NULL AND updated_at=$7`,
-		v.OwnerName, v.OwnerPhone, v.Color, v.Plate, v.UpdatedAt, v.ID, v.UpdatedAt)
+		v.OwnerName, v.OwnerPhone, v.Color, v.Plate, now, v.ID, v.UpdatedAt)
+	if err == nil {
+		v.UpdatedAt = now
+	}
 	return wrap(res, err, ErrConcurrentModify)
 }
 func (p *Postgres) ArchiveVehicle(ctx context.Context, id string, now time.Time) error {
@@ -216,9 +222,12 @@ func (p *Postgres) GetParkingArea(ctx context.Context, id string) (*model.Parkin
 	err := scanArea(p.q(ctx).QueryRowContext(ctx, `SELECT `+areaCols+` FROM parking_areas WHERE id=$1 AND archived_at IS NULL`, id), a)
 	return a, mapNotFound(err)
 }
-func (p *Postgres) UpdateParkingArea(ctx context.Context, a *model.ParkingArea) error {
+func (p *Postgres) UpdateParkingArea(ctx context.Context, a *model.ParkingArea, now time.Time) error {
 	res, err := p.q(ctx).ExecContext(ctx, `UPDATE parking_areas SET name=$1,code=$2,capacity=$3,updated_at=$4 WHERE id=$5 AND archived_at IS NULL AND updated_at=$6`,
-		a.Name, a.Code, a.Capacity, a.UpdatedAt, a.ID, a.UpdatedAt)
+		a.Name, a.Code, a.Capacity, now, a.ID, a.UpdatedAt)
+	if err == nil {
+		a.UpdatedAt = now
+	}
 	return wrap(res, err, ErrConcurrentModify)
 }
 func (p *Postgres) ArchiveParkingArea(ctx context.Context, id string, now time.Time) error {
@@ -279,9 +288,12 @@ func (p *Postgres) GetAuthorization(ctx context.Context, id string) (*model.Auth
 	err := scanAuth(p.q(ctx).QueryRowContext(ctx, `SELECT `+authCols+` FROM authorizations WHERE id=$1 AND archived_at IS NULL`, id), a)
 	return a, mapNotFound(err)
 }
-func (p *Postgres) UpdateAuthorization(ctx context.Context, a *model.Authorization) error {
+func (p *Postgres) UpdateAuthorization(ctx context.Context, a *model.Authorization, now time.Time) error {
 	res, err := p.q(ctx).ExecContext(ctx, `UPDATE authorizations SET start_time=$1,end_time=$2,status=$3,purpose=$4,parking_area_id=$5,updated_at=$6 WHERE id=$7 AND archived_at IS NULL AND updated_at=$8`,
-		a.StartTime, a.EndTime, a.Status, a.Purpose, a.ParkingAreaID, a.UpdatedAt, a.ID, a.UpdatedAt)
+		a.StartTime, a.EndTime, a.Status, a.Purpose, a.ParkingAreaID, now, a.ID, a.UpdatedAt)
+	if err == nil {
+		a.UpdatedAt = now
+	}
 	return wrap(res, err, ErrConcurrentModify)
 }
 func (p *Postgres) ArchiveAuthorization(ctx context.Context, id string, now time.Time) error {
@@ -519,8 +531,10 @@ func (p *Postgres) ExitVehicle(ctx context.Context, authID string, now time.Time
 		}
 		// Fee generation within the same transaction as the exit and capacity
 		// release. Look up the rule effective at entry time; if none, skip.
+		// A rule archived after entry time is still effective at entry, so it
+		// is included; only rules archived at or before entry are excluded.
 		rule := &model.BillingRule{}
-		err := scanBillingRule(p.q(ctx).QueryRowContext(ctx, `SELECT `+billingRuleCols+` FROM billing_rules WHERE parking_area_id=$1 AND archived_at IS NULL AND effective_from <= $2 ORDER BY effective_from DESC LIMIT 1`, areaID, entryTime), rule)
+		err := scanBillingRule(p.q(ctx).QueryRowContext(ctx, `SELECT `+billingRuleCols+` FROM billing_rules WHERE parking_area_id=$1 AND (archived_at IS NULL OR archived_at > $2) AND effective_from <= $3 ORDER BY effective_from DESC LIMIT 1`, areaID, entryTime, entryTime), rule)
 		if err == nil {
 			charged, amount := ComputeFee(entryTime, now, rule.FreeMinutes, rule.HourlyRateCents, rule.DailyCapCents)
 			fee = &model.Fee{
@@ -599,11 +613,14 @@ func (p *Postgres) GetBillingRule(ctx context.Context, id string) (*model.Billin
 	err := scanBillingRule(p.q(ctx).QueryRowContext(ctx, `SELECT `+billingRuleCols+` FROM billing_rules WHERE id=$1 AND archived_at IS NULL`, id), r)
 	return r, mapNotFound(err)
 }
-func (p *Postgres) UpdateBillingRule(ctx context.Context, r *model.BillingRule) error {
+func (p *Postgres) UpdateBillingRule(ctx context.Context, r *model.BillingRule, now time.Time) error {
 	res, err := p.q(ctx).ExecContext(ctx, `UPDATE billing_rules SET free_minutes=$1,hourly_rate_cents=$2,daily_cap_cents=$3,effective_from=$4,status=$5,updated_at=$6 WHERE id=$7 AND archived_at IS NULL AND updated_at=$8`,
-		r.FreeMinutes, r.HourlyRateCents, r.DailyCapCents, r.EffectiveFrom, r.Status, r.UpdatedAt, r.ID, r.UpdatedAt)
+		r.FreeMinutes, r.HourlyRateCents, r.DailyCapCents, r.EffectiveFrom, r.Status, now, r.ID, r.UpdatedAt)
 	if err != nil && isUniqueViolation(err) {
 		return ErrConflict
+	}
+	if err == nil {
+		r.UpdatedAt = now
 	}
 	return wrap(res, err, ErrConcurrentModify)
 }
@@ -649,7 +666,7 @@ func (p *Postgres) ListBillingRules(ctx context.Context, f BillingRuleFilter) ([
 }
 func (p *Postgres) ActiveBillingRule(ctx context.Context, areaID string, at time.Time) (*model.BillingRule, error) {
 	r := &model.BillingRule{}
-	err := scanBillingRule(p.q(ctx).QueryRowContext(ctx, `SELECT `+billingRuleCols+` FROM billing_rules WHERE parking_area_id=$1 AND archived_at IS NULL AND effective_from <= $2 ORDER BY effective_from DESC LIMIT 1`, areaID, at), r)
+	err := scanBillingRule(p.q(ctx).QueryRowContext(ctx, `SELECT `+billingRuleCols+` FROM billing_rules WHERE parking_area_id=$1 AND (archived_at IS NULL OR archived_at > $2) AND effective_from <= $3 ORDER BY effective_from DESC LIMIT 1`, areaID, at, at), r)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil // no applicable rule
 	}

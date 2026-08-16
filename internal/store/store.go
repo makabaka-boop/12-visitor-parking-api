@@ -48,23 +48,28 @@ type AreaRevenueFilter struct {
 type Store interface {
 	CreateResident(ctx context.Context, r *model.Resident) error
 	GetResident(ctx context.Context, id string) (*model.Resident, error)
-	UpdateResident(ctx context.Context, r *model.Resident) error // optimistic lock via updated_at
+	// UpdateResident applies an optimistic-lock update. r.UpdatedAt is the
+	// version token the caller read (NOT a freshly generated timestamp); the
+	// store checks it against the currently stored updated_at and, on match,
+	// bumps updated_at to now. now is passed in so the store owns the version
+	// advancement and the atomic check against the client's token.
+	UpdateResident(ctx context.Context, r *model.Resident, now time.Time) error
 	ArchiveResident(ctx context.Context, id string, now time.Time) error
 	ListResidents(ctx context.Context, page model.Page) ([]*model.Resident, int64, error)
 	CreateVehicle(ctx context.Context, v *model.Vehicle) error
 	GetVehicle(ctx context.Context, id string) (*model.Vehicle, error)
 	GetVehicleByPlate(ctx context.Context, plate string) (*model.Vehicle, error)
-	UpdateVehicle(ctx context.Context, v *model.Vehicle) error
+	UpdateVehicle(ctx context.Context, v *model.Vehicle, now time.Time) error
 	ArchiveVehicle(ctx context.Context, id string, now time.Time) error
 	ListVehicles(ctx context.Context, page model.Page) ([]*model.Vehicle, int64, error)
 	CreateParkingArea(ctx context.Context, a *model.ParkingArea) error
 	GetParkingArea(ctx context.Context, id string) (*model.ParkingArea, error)
-	UpdateParkingArea(ctx context.Context, a *model.ParkingArea) error
+	UpdateParkingArea(ctx context.Context, a *model.ParkingArea, now time.Time) error
 	ArchiveParkingArea(ctx context.Context, id string, now time.Time) error
 	ListParkingAreas(ctx context.Context, page model.Page) ([]*model.ParkingArea, int64, error)
 	CreateAuthorization(ctx context.Context, a *model.Authorization, now time.Time) error
 	GetAuthorization(ctx context.Context, id string) (*model.Authorization, error)
-	UpdateAuthorization(ctx context.Context, a *model.Authorization) error // optimistic lock
+	UpdateAuthorization(ctx context.Context, a *model.Authorization, now time.Time) error // optimistic lock
 	ArchiveAuthorization(ctx context.Context, id string, now time.Time) error
 	ListAuthorizations(ctx context.Context, f model.AuthFilter) ([]*model.Authorization, int64, error)
 	CreateRecord(ctx context.Context, r *model.EntryExitRecord) error
@@ -79,12 +84,13 @@ type Store interface {
 	AreaOccupancy(ctx context.Context) ([]*model.AreaOccupancy, error)
 	CreateBillingRule(ctx context.Context, r *model.BillingRule) error
 	GetBillingRule(ctx context.Context, id string) (*model.BillingRule, error)
-	UpdateBillingRule(ctx context.Context, r *model.BillingRule) error // optimistic lock via updated_at
+	UpdateBillingRule(ctx context.Context, r *model.BillingRule, now time.Time) error // optimistic lock via updated_at
 	ArchiveBillingRule(ctx context.Context, id string, now time.Time) error
 	ListBillingRules(ctx context.Context, f BillingRuleFilter) ([]*model.BillingRule, int64, error)
 	// ActiveBillingRule returns the rule effective for areaID at time at (the
-	// latest non-archived rule with effective_from <= at), or (nil, nil) when
-	// no such rule exists.
+	// latest rule with effective_from <= at that was not archived at or before
+	// at), or (nil, nil) when no such rule exists. A rule archived after `at`
+	// is still considered because it was in effect at `at`.
 	ActiveBillingRule(ctx context.Context, areaID string, at time.Time) (*model.BillingRule, error)
 	CreateFee(ctx context.Context, f *model.Fee) error
 	GetFee(ctx context.Context, id string) (*model.Fee, error)
