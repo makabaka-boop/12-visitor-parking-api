@@ -20,7 +20,7 @@
 │   ├── store/                  # Store 接口 + 内存实现 + PostgreSQL 实现
 │   ├── service/                # 业务逻辑、校验、状态迁移、审计
 │   ├── httpd/                  # HTTP 路由、统一响应、结构化日志、健康检查
-│   └── migrations/             # 内嵌 SQL 迁移脚本
+│   └── migrations/             # 内嵌 SQL 迁移脚本（001_init + 002_extension）
 ├── Dockerfile                  # 生产多阶段镜像（官方多架构，容器内按平台编译）
 ├── benzhi.Dockerfile           # 评测镜像（保留完整 Go 工具链）
 ├── build_benzhi_docker.sh      # 评测构建脚本
@@ -44,6 +44,15 @@
   pending ──revoke──▶ cancelled                    （物业撤销，未入场）
   pending ──(超过 end_time)──▶ expired             （动态判定）
   active 只能 exit，不能 revoke；completed/cancelled 为终态。
+  pending/active 可发起延期申请（approved 后回写 end_time）。
+```
+
+```
+延期申请状态：
+  pending ──approve──▶ approved   （回写授权 end_time）
+  pending ──reject───▶ rejected
+  pending ──revoke───▶ revoked
+  approved/rejected/revoked 为终态；仅 pending 可审批/驳回/撤销。
 ```
 
 ## 快速开始
@@ -133,6 +142,36 @@ go vet ./...                   # 静态检查
      -d '{"operator":"mgr","reason":"住户取消"}'
    # 已入场的授权撤销 → 409（需先离场）
    ```
+7. **延期申请**（物业为尚未离场的有效授权提交延期，新结束时间须晚于原结束时间）
+   ```bash
+   curl -s -X POST localhost:8117/api/v1/extension-applications \
+     -H 'Content-Type: application/json' \
+     -d '{
+       "authorization_id":"auth_...",
+       "new_end_time":"2026-08-16T20:00:00Z",
+       "reason":"访客需多停留","applicant":"物业小王"
+     }'
+   # → data.id = ext_..., status=pending
+   # 新结束时间不晚于原结束时间 → 400；累计时长超 7 天 → 400
+   # 已完成/已撤销/已过期授权 → 409；同一授权已有待审批申请 → 409
+   ```
+8. **审批延期申请**（事务内更新授权有效期与申请状态，重新检查同车牌重叠）
+   ```bash
+   curl -s -X POST localhost:8117/api/v1/extension-applications/ext_.../approve \
+     -H 'Content-Type: application/json' \
+     -d '{"approver":"mgr李","note":"同意延期"}'
+   # → data.application.status=approved, data.authorization.end_time 已更新
+   # 审批时若同车牌其他有效授权重叠 → 409（授权有效期不变）
+   ```
+9. **驳回 / 撤销延期申请**（仅待审批可操作）
+   ```bash
+   curl -s -X POST localhost:8117/api/v1/extension-applications/ext_.../reject \
+     -H 'Content-Type: application/json' \
+     -d '{"approver":"mgr李","reason":"理由不充分"}'
+   curl -s -X POST localhost:8117/api/v1/extension-applications/ext_.../revoke \
+     -H 'Content-Type: application/json' \
+     -d '{"operator":"小王","reason":"申请人撤回"}'
+   ```
 
 ## 接口一览
 
@@ -152,6 +191,11 @@ go vet ./...                   # 静态检查
 | POST | `/api/v1/authorizations/{id}/revoke` | 撤销（仅 pending） |
 | POST | `/api/v1/authorizations/{id}/entry` | 车辆入场 |
 | POST | `/api/v1/authorizations/{id}/exit` | 车辆离场 |
+| POST/GET | `/api/v1/extension-applications` | 创建 / 分页列表（延期申请） |
+| GET | `/api/v1/extension-applications/{id}` | 申请详情 |
+| POST | `/api/v1/extension-applications/{id}/approve` | 审批通过（事务内更新授权有效期） |
+| POST | `/api/v1/extension-applications/{id}/reject` | 驳回（仅待审批） |
+| POST | `/api/v1/extension-applications/{id}/revoke` | 撤销（仅待审批） |
 | GET | `/api/v1/records` | 进出记录（area_id/status/plate 筛选） |
 | GET | `/api/v1/stats/current-vehicles` | 当前在场车辆（可加 area_id） |
 | GET | `/api/v1/stats/today-arrivals` | 今日预计到访 |
@@ -176,6 +220,22 @@ curl -s 'localhost:8117/api/v1/stats/occupancy'
 - `end_time` 晚于 `start_time`
 - 单次时长 ≤ 7 天
 - 同一车牌在重叠时间内只能存在一条有效授权（pending/active），冲突 → 409
+
+## 延期申请模块
+
+物业人员可为**尚未离场的有效授权**（pending 且未过期，或 active）提交延期申请，记录新的结束时间、延期原因和申请人。
+
+- **创建申请**：`new_end_time` 必须晚于原 `end_time`；授权累计时长（原 `start_time` → `new_end_time`）≤ 7 天
+- **不可延期**：已完成（completed）/ 已撤销（cancelled）/ 已过期（expired）授权 → 409
+- **唯一待审批**：同一授权同时只能存在一条 `pending` 申请，重复提交 → 409（PostgreSQL 由部分唯一索引 `idx_extapp_pending_auth` 保证）
+- **审批通过**：在事务内重新检查同一车牌其他有效授权是否与新区间（`start_time` → `new_end_time`）重叠，重叠 → 409 且授权有效期不变；通过则在同一事务内更新授权 `end_time`、申请状态为 `approved`，记录审批人、审批时间并写审计日志
+- **驳回 / 撤销**：仅待审批申请可操作，授权有效期不变；撤销后可重新为该授权提交申请
+- **分页查询**：支持 `authorization_id`、`plate`、`status`、`applicant` 筛选与 `limit`/`offset`，按 `created_at` 降序
+
+```bash
+curl -s 'localhost:8117/api/v1/extension-applications?status=pending&limit=10'
+curl -s 'localhost:8117/api/v1/extension-applications?authorization_id=auth_...'
+```
 
 ## Docker
 
@@ -216,4 +276,4 @@ go test ./... -v        # 服务层 + HTTP 层，内存存储，无外部依赖
 go test -race ./...     # 竞态检测
 ```
 
-覆盖：创建授权全部校验规则、重叠冲突、入场/离场状态迁移、容量限制、重复入场/离场冲突、撤销前置状态、更新并发冲突、统计接口、软删除、统一错误响应与校验明细。
+覆盖：创建授权全部校验规则、重叠冲突、入场/离场状态迁移、容量限制、重复入场/离场冲突、撤销前置状态、更新并发冲突、统计接口、软删除、统一错误响应与校验明细，以及延期申请创建校验（新结束时间晚于原结束时间、累计 ≤ 7 天、不可延期授权、唯一待审批）、审批通过回写授权有效期、审批时同车牌重叠冲突、驳回/撤销状态迁移、分页查询与审批审计日志。

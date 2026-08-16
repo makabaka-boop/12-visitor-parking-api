@@ -51,6 +51,9 @@ func writeErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrStatusTransition):
 		status = http.StatusConflict
 		body.Message = "invalid status transition for current state"
+	case errors.Is(err, store.ErrNotExtensible):
+		status = http.StatusConflict
+		body.Message = "authorization is not eligible for extension (completed, cancelled or expired)"
 	case errors.Is(err, store.ErrNoCapacity):
 		status = http.StatusConflict
 		body.Message = "parking area is full"

@@ -17,6 +17,7 @@ var (
 	ErrOutOfTimeWindow  = errors.New("authorization is outside its valid time window")
 	ErrResidentDisabled = errors.New("resident is disabled")
 	ErrAreaArchived     = errors.New("parking area is archived")
+	ErrNotExtensible    = errors.New("authorization is not eligible for extension") // completed/cancelled/expired
 )
 type RecordFilter struct {
 	AreaID string
@@ -52,6 +53,13 @@ type Store interface {
 	EnterVehicle(ctx context.Context, authID string, now time.Time) (*model.EntryExitRecord, error)
 	ExitVehicle(ctx context.Context, authID string, now time.Time, operator, note string) (*model.EntryExitRecord, error)
 	RevokeAuthorization(ctx context.Context, authID string, now time.Time, operator, reason string) (*model.Authorization, error)
+	// Extension applications.
+	CreateExtensionApplication(ctx context.Context, app *model.ExtensionApplication, now time.Time) error
+	GetExtensionApplication(ctx context.Context, id string) (*model.ExtensionApplication, error)
+	ApproveExtensionApplication(ctx context.Context, appID string, now time.Time, approver, note string) (*model.ExtensionApplication, *model.Authorization, error)
+	RejectExtensionApplication(ctx context.Context, appID string, now time.Time, approver, reason string) (*model.ExtensionApplication, error)
+	RevokeExtensionApplication(ctx context.Context, appID string, now time.Time, operator, reason string) (*model.ExtensionApplication, error)
+	ListExtensionApplications(ctx context.Context, f model.ExtensionAppFilter) ([]*model.ExtensionApplication, int64, error)
 	CreateAuditLog(ctx context.Context, l *model.AuditLog) error
 	ListAuditLogs(ctx context.Context, entityType string, page model.Page) ([]*model.AuditLog, int64, error)
 	ListCurrentVehicles(ctx context.Context, areaID string, page model.Page) ([]*model.EntryExitRecord, int64, error)

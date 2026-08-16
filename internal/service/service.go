@@ -9,7 +9,6 @@ import (
 	"visitor-parking/internal/plate"
 	"visitor-parking/internal/store"
 )
-const MaxAuthDuration = 7 * 24 * time.Hour
 const ExpiringSoonWindow = 6 * time.Hour
 type Service struct {
 	store store.Store
@@ -299,7 +298,7 @@ func (s *Service) CreateAuthorization(ctx context.Context, in CreateAuthorizatio
 	if !in.EndTime.After(in.StartTime) {
 		return nil, newFieldError("end_time", "must be later than start_time")
 	}
-	if in.EndTime.Sub(in.StartTime) > MaxAuthDuration {
+	if in.EndTime.Sub(in.StartTime) > model.MaxAuthDuration {
 		return nil, newFieldError("end_time", "authorization duration must not exceed 7 days")
 	}
 	a := &model.Authorization{
@@ -348,7 +347,7 @@ func (s *Service) UpdateAuthorization(ctx context.Context, id string, in *model.
 	if !in.EndTime.After(in.StartTime) {
 		return nil, newFieldError("end_time", "must be later than start_time")
 	}
-	if in.EndTime.Sub(in.StartTime) > MaxAuthDuration {
+	if in.EndTime.Sub(in.StartTime) > model.MaxAuthDuration {
 		return nil, newFieldError("end_time", "authorization duration must not exceed 7 days")
 	}
 	cur.StartTime = in.StartTime
@@ -462,6 +461,121 @@ func (s *Service) AreaOccupancy(ctx context.Context) ([]*model.AreaOccupancy, er
 func (s *Service) ListAuditLogs(ctx context.Context, entityType string, limit, offset int) ([]*model.AuditLog, error) {
 	logs, _, err := s.store.ListAuditLogs(ctx, entityType, normPage(limit, offset))
 	return logs, err
+}
+// --- Extension applications (延期申请) ---
+type CreateExtensionInput struct {
+	AuthorizationID string    `json:"authorization_id"`
+	NewEndTime      time.Time `json:"new_end_time"`
+	Reason          string    `json:"reason"`    // 延期原因
+	Applicant       string    `json:"applicant"` // 申请人
+}
+func (s *Service) CreateExtensionApplication(ctx context.Context, in CreateExtensionInput) (*model.ExtensionApplication, error) {
+	if in.NewEndTime.IsZero() {
+		return nil, newFieldError("new_end_time", "new_end_time is required")
+	}
+	if strings.TrimSpace(in.Reason) == "" {
+		return nil, newFieldError("reason", "must not be empty")
+	}
+	if strings.TrimSpace(in.Applicant) == "" {
+		return nil, newFieldError("applicant", "must not be empty")
+	}
+	now := s.nowT()
+	a, err := s.store.GetAuthorization(ctx, in.AuthorizationID)
+	if err != nil {
+		return nil, err
+	}
+	if !model.ExtensibleAuth(a.Status, a.EndTime, now) {
+		return nil, store.ErrNotExtensible
+	}
+	if !in.NewEndTime.After(a.EndTime) {
+		return nil, newFieldError("new_end_time", "must be later than the original end_time")
+	}
+	if in.NewEndTime.Sub(a.StartTime) > model.MaxAuthDuration {
+		return nil, newFieldError("new_end_time", "total authorization duration must not exceed 7 days")
+	}
+	app := &model.ExtensionApplication{
+		ID:              store.NewID("ext"),
+		AuthorizationID: a.ID,
+		Plate:           a.Plate,
+		OriginalEndTime: a.EndTime,
+		NewEndTime:      in.NewEndTime,
+		Reason:          strings.TrimSpace(in.Reason),
+		Applicant:       strings.TrimSpace(in.Applicant),
+		Status:          model.ExtStatusPending,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	if err := s.store.CreateExtensionApplication(ctx, app, now); err != nil {
+		return nil, err
+	}
+	s.audit(ctx, "extension.create", "extension_application", app.ID, app.Applicant, "extension application created")
+	return app, nil
+}
+func (s *Service) GetExtensionApplication(ctx context.Context, id string) (*model.ExtensionApplication, error) {
+	return s.store.GetExtensionApplication(ctx, id)
+}
+type ApproveExtensionInput struct {
+	Approver string `json:"approver"`
+	Note     string `json:"note"`
+}
+// ApproveExtensionApplication delegates to the store, which updates the
+// authorization end_time and application status and writes the audit log inside
+// a single transaction (per requirement). No separate audit call is made here.
+func (s *Service) ApproveExtensionApplication(ctx context.Context, appID string, in ApproveExtensionInput) (*model.ExtensionApplication, *model.Authorization, error) {
+	now := s.nowT()
+	approver := defStr(strings.TrimSpace(in.Approver), "system")
+	app, auth, err := s.store.ApproveExtensionApplication(ctx, appID, now, approver, strings.TrimSpace(in.Note))
+	if err != nil {
+		return nil, nil, err
+	}
+	return app, auth, nil
+}
+type RejectExtensionInput struct {
+	Approver string `json:"approver"`
+	Reason   string `json:"reason"` // 驳回原因
+}
+func (s *Service) RejectExtensionApplication(ctx context.Context, appID string, in RejectExtensionInput) (*model.ExtensionApplication, error) {
+	if strings.TrimSpace(in.Reason) == "" {
+		return nil, newFieldError("reason", "reject reason must not be empty")
+	}
+	now := s.nowT()
+	approver := defStr(strings.TrimSpace(in.Approver), "system")
+	app, err := s.store.RejectExtensionApplication(ctx, appID, now, approver, strings.TrimSpace(in.Reason))
+	if err != nil {
+		return nil, err
+	}
+	s.audit(ctx, "extension.reject", "extension_application", appID, approver, "extension application rejected: "+in.Reason)
+	return app, nil
+}
+type RevokeExtensionInput struct {
+	Operator string `json:"operator"`
+	Reason   string `json:"reason"` // 撤销原因
+}
+func (s *Service) RevokeExtensionApplication(ctx context.Context, appID string, in RevokeExtensionInput) (*model.ExtensionApplication, error) {
+	now := s.nowT()
+	operator := defStr(strings.TrimSpace(in.Operator), "system")
+	app, err := s.store.RevokeExtensionApplication(ctx, appID, now, operator, strings.TrimSpace(in.Reason))
+	if err != nil {
+		return nil, err
+	}
+	s.audit(ctx, "extension.revoke", "extension_application", appID, operator, "extension application revoked: "+in.Reason)
+	return app, nil
+}
+type ListExtensionFilter struct {
+	AuthorizationID string
+	Plate           string
+	Status          string
+	Applicant       string
+	Limit, Offset   int
+}
+func (s *Service) ListExtensionApplications(ctx context.Context, f ListExtensionFilter) ([]*model.ExtensionApplication, int64, error) {
+	return s.store.ListExtensionApplications(ctx, model.ExtensionAppFilter{
+		AuthorizationID: f.AuthorizationID,
+		Plate:           plate.Normalize(f.Plate),
+		Status:          f.Status,
+		Applicant:       f.Applicant,
+		Page:            normPage(f.Limit, f.Offset),
+	})
 }
 func (s *Service) audit(ctx context.Context, action, etype, eid, operator, detail string) {
 	_ = s.store.CreateAuditLog(ctx, &model.AuditLog{

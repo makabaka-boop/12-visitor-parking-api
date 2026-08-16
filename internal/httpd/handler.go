@@ -38,6 +38,12 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/authorizations/{id}/revoke", h.revokeAuth)
 	mux.HandleFunc("POST /api/v1/authorizations/{id}/entry", h.entry)
 	mux.HandleFunc("POST /api/v1/authorizations/{id}/exit", h.exit)
+	mux.HandleFunc("POST /api/v1/extension-applications", h.createExtensionApp)
+	mux.HandleFunc("GET /api/v1/extension-applications", h.listExtensionApps)
+	mux.HandleFunc("GET /api/v1/extension-applications/{id}", h.getExtensionApp)
+	mux.HandleFunc("POST /api/v1/extension-applications/{id}/approve", h.approveExtensionApp)
+	mux.HandleFunc("POST /api/v1/extension-applications/{id}/reject", h.rejectExtensionApp)
+	mux.HandleFunc("POST /api/v1/extension-applications/{id}/revoke", h.revokeExtensionApp)
 	mux.HandleFunc("GET /api/v1/records", h.listRecords)
 	mux.HandleFunc("GET /api/v1/stats/current-vehicles", h.currentVehicles)
 	mux.HandleFunc("GET /api/v1/stats/today-arrivals", h.todayArrivals)
@@ -297,6 +303,77 @@ func (h *Handler) exit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeOK(w, http.StatusOK, rec)
+}
+func (h *Handler) createExtensionApp(w http.ResponseWriter, r *http.Request) {
+	var in service.CreateExtensionInput
+	if err := decodeJSON(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	in.NewEndTime = parseTimeFlexible(in.NewEndTime)
+	app, err := h.svc.CreateExtensionApplication(r.Context(), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, http.StatusCreated, app)
+}
+func (h *Handler) listExtensionApps(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	f := service.ListExtensionFilter{
+		AuthorizationID: q.Get("authorization_id"),
+		Plate:           q.Get("plate"),
+		Status:          q.Get("status"),
+		Applicant:       q.Get("applicant"),
+	}
+	f.Limit, f.Offset = parsePage(r)
+	items, total, err := h.svc.ListExtensionApplications(r.Context(), f)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, http.StatusOK, paginate(items, total, f.Limit, f.Offset))
+}
+func (h *Handler) getExtensionApp(w http.ResponseWriter, r *http.Request) {
+	app, err := h.svc.GetExtensionApplication(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, http.StatusOK, app)
+}
+func (h *Handler) approveExtensionApp(w http.ResponseWriter, r *http.Request) {
+	var in service.ApproveExtensionInput
+	_ = decodeJSON(r, &in)
+	app, auth, err := h.svc.ApproveExtensionApplication(r.Context(), r.PathValue("id"), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, http.StatusOK, map[string]interface{}{"application": app, "authorization": auth})
+}
+func (h *Handler) rejectExtensionApp(w http.ResponseWriter, r *http.Request) {
+	var in service.RejectExtensionInput
+	if err := decodeJSON(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	app, err := h.svc.RejectExtensionApplication(r.Context(), r.PathValue("id"), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, http.StatusOK, app)
+}
+func (h *Handler) revokeExtensionApp(w http.ResponseWriter, r *http.Request) {
+	var in service.RevokeExtensionInput
+	_ = decodeJSON(r, &in)
+	app, err := h.svc.RevokeExtensionApplication(r.Context(), r.PathValue("id"), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, http.StatusOK, app)
 }
 func (h *Handler) listRecords(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()

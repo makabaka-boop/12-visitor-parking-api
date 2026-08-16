@@ -14,6 +14,7 @@ type Memory struct {
 	areas     map[string]*model.ParkingArea
 	auths     map[string]*model.Authorization
 	records   map[string]*model.EntryExitRecord
+	extApps   map[string]*model.ExtensionApplication
 	logs      map[string]*model.AuditLog
 }
 func NewMemory() *Memory {
@@ -23,6 +24,7 @@ func NewMemory() *Memory {
 		areas:     make(map[string]*model.ParkingArea),
 		auths:     make(map[string]*model.Authorization),
 		records:   make(map[string]*model.EntryExitRecord),
+		extApps:   make(map[string]*model.ExtensionApplication),
 		logs:      make(map[string]*model.AuditLog),
 	}
 }
@@ -56,6 +58,11 @@ func cloneAuth(a *model.Authorization) *model.Authorization {
 func cloneRecord(r *model.EntryExitRecord) *model.EntryExitRecord {
 	c := *r
 	c.ExitTime = clonePtr(r.ExitTime)
+	return &c
+}
+func cloneExtApp(a *model.ExtensionApplication) *model.ExtensionApplication {
+	c := *a
+	c.DecidedAt = clonePtr(a.DecidedAt)
 	return &c
 }
 func normPage(p model.Page) model.Page {
@@ -546,4 +553,147 @@ func (m *Memory) RevokeAuthorization(ctx context.Context, authID string, now tim
 	a.UpdatedAt = now
 	m.auths[authID] = cloneAuth(a)
 	return cloneAuth(a), nil
+}
+func (m *Memory) CreateExtensionApplication(ctx context.Context, app *model.ExtensionApplication, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.auths[app.AuthorizationID]
+	if !ok || a.ArchivedAt != nil {
+		return ErrNotFound
+	}
+	if !model.ExtensibleAuth(a.Status, a.EndTime, now) {
+		return ErrNotExtensible
+	}
+	for _, ex := range m.extApps {
+		if ex.AuthorizationID == app.AuthorizationID && ex.Status == model.ExtStatusPending {
+			return ErrConflict
+		}
+	}
+	app.Plate = a.Plate
+	app.OriginalEndTime = a.EndTime
+	m.extApps[app.ID] = cloneExtApp(app)
+	return nil
+}
+func (m *Memory) GetExtensionApplication(ctx context.Context, id string) (*model.ExtensionApplication, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.extApps[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return cloneExtApp(app), nil
+}
+// ApproveExtensionApplication mutates the authorization's end_time and the
+// application status under the same lock, re-checking eligibility, the 7-day
+// cap and plate overlap. The audit log is written here (within the logical
+// transaction) so it commits atomically with the state change.
+func (m *Memory) ApproveExtensionApplication(ctx context.Context, appID string, now time.Time, approver, note string) (*model.ExtensionApplication, *model.Authorization, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.extApps[appID]
+	if !ok {
+		return nil, nil, ErrNotFound
+	}
+	if app.Status != model.ExtStatusPending {
+		return nil, nil, ErrStatusTransition
+	}
+	a, ok := m.auths[app.AuthorizationID]
+	if !ok || a.ArchivedAt != nil {
+		return nil, nil, ErrNotFound
+	}
+	if !model.ExtensibleAuth(a.Status, a.EndTime, now) {
+		return nil, nil, ErrNotExtensible
+	}
+	if !app.NewEndTime.After(a.EndTime) {
+		return nil, nil, fmt.Errorf("%w: new end time must be later than current authorization end time", ErrConflict)
+	}
+	if app.NewEndTime.Sub(a.StartTime) > model.MaxAuthDuration {
+		return nil, nil, fmt.Errorf("%w: total authorization duration must not exceed 7 days", ErrConflict)
+	}
+	for _, ex := range m.auths {
+		if ex.ArchivedAt != nil || ex.ID == a.ID || ex.Plate != a.Plate {
+			continue
+		}
+		if ex.Status == model.AuthStatusCompleted || ex.Status == model.AuthStatusCancelled {
+			continue
+		}
+		if a.StartTime.Before(ex.EndTime) && ex.StartTime.Before(app.NewEndTime) {
+			return nil, nil, ErrConflict
+		}
+	}
+	a.EndTime = app.NewEndTime
+	a.UpdatedAt = now
+	m.auths[a.ID] = cloneAuth(a)
+	decided := now
+	app.Status = model.ExtStatusApproved
+	app.DecidedBy = approver
+	app.DecidedAt = &decided
+	app.DecisionNote = note
+	app.UpdatedAt = now
+	m.extApps[app.ID] = cloneExtApp(app)
+	m.logs[NewID("log")] = &model.AuditLog{
+		Action: "extension.approve", EntityType: "extension_application", EntityID: app.ID,
+		Operator: approver, Detail: fmt.Sprintf("approved; authorization %s end_time extended to %s", a.ID, app.NewEndTime.Format(time.RFC3339)), CreatedAt: now,
+	}
+	return cloneExtApp(app), cloneAuth(a), nil
+}
+func (m *Memory) RejectExtensionApplication(ctx context.Context, appID string, now time.Time, approver, reason string) (*model.ExtensionApplication, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.extApps[appID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if app.Status != model.ExtStatusPending {
+		return nil, ErrStatusTransition
+	}
+	decided := now
+	app.Status = model.ExtStatusRejected
+	app.DecidedBy = approver
+	app.DecidedAt = &decided
+	app.DecisionNote = reason
+	app.UpdatedAt = now
+	m.extApps[app.ID] = cloneExtApp(app)
+	return cloneExtApp(app), nil
+}
+func (m *Memory) RevokeExtensionApplication(ctx context.Context, appID string, now time.Time, operator, reason string) (*model.ExtensionApplication, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	app, ok := m.extApps[appID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if app.Status != model.ExtStatusPending {
+		return nil, ErrStatusTransition
+	}
+	decided := now
+	app.Status = model.ExtStatusRevoked
+	app.DecidedBy = operator
+	app.DecidedAt = &decided
+	app.DecisionNote = reason
+	app.UpdatedAt = now
+	m.extApps[app.ID] = cloneExtApp(app)
+	return cloneExtApp(app), nil
+}
+func (m *Memory) ListExtensionApplications(ctx context.Context, f model.ExtensionAppFilter) ([]*model.ExtensionApplication, int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*model.ExtensionApplication, 0, len(m.extApps))
+	for _, app := range m.extApps {
+		if f.AuthorizationID != "" && app.AuthorizationID != f.AuthorizationID {
+			continue
+		}
+		if f.Plate != "" && app.Plate != f.Plate {
+			continue
+		}
+		if f.Status != "" && app.Status != f.Status {
+			continue
+		}
+		if f.Applicant != "" && app.Applicant != f.Applicant {
+			continue
+		}
+		out = append(out, cloneExtApp(app))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return pageOf(out, f.Page), int64(len(out)), nil
 }

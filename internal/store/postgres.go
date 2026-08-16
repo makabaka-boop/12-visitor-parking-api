@@ -89,6 +89,9 @@ func scanAuth(s scanner, a *model.Authorization) error {
 func scanRecord(s scanner, r *model.EntryExitRecord) error {
 	return s.Scan(&r.ID, &r.AuthorizationID, &r.Plate, &r.ParkingAreaID, &r.EntryTime, &r.ExitTime, &r.ExitOperator, &r.ExitNote, &r.Status, &r.CreatedAt, &r.UpdatedAt)
 }
+func scanExtApp(s scanner, a *model.ExtensionApplication) error {
+	return s.Scan(&a.ID, &a.AuthorizationID, &a.Plate, &a.OriginalEndTime, &a.NewEndTime, &a.Reason, &a.Applicant, &a.Status, &a.DecidedBy, &a.DecidedAt, &a.DecisionNote, &a.CreatedAt, &a.UpdatedAt)
+}
 const residentCols = "id,name,phone,building,unit,room,status,archived_at,created_at,updated_at"
 func (p *Postgres) CreateResident(ctx context.Context, r *model.Resident) error {
 	_, err := p.q(ctx).ExecContext(ctx, `INSERT INTO residents (`+residentCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
@@ -515,4 +518,180 @@ func (p *Postgres) RevokeAuthorization(ctx context.Context, authID string, now t
 		return nil, err
 	}
 	return p.GetAuthorization(ctx, authID)
+}
+const extAppCols = "id,authorization_id,plate,original_end_time,new_end_time,reason,applicant,status,decided_by,decided_at,decision_note,created_at,updated_at"
+func (p *Postgres) CreateExtensionApplication(ctx context.Context, app *model.ExtensionApplication, now time.Time) error {
+	return p.runTx(ctx, func(ctx context.Context) error {
+		var plate, status string
+		var endTime time.Time
+		err := p.q(ctx).QueryRowContext(ctx, `SELECT plate,status,end_time FROM authorizations WHERE id=$1 AND archived_at IS NULL FOR UPDATE`, app.AuthorizationID).
+			Scan(&plate, &status, &endTime)
+		if err != nil {
+			return mapNotFound(err)
+		}
+		if !model.ExtensibleAuth(status, endTime, now) {
+			return ErrNotExtensible
+		}
+		var n int64
+		if err := p.q(ctx).QueryRowContext(ctx, `SELECT count(*) FROM extension_applications WHERE authorization_id=$1 AND status='pending'`, app.AuthorizationID).Scan(&n); err != nil {
+			return err
+		}
+		if n > 0 {
+			return ErrConflict
+		}
+		app.Plate = plate
+		app.OriginalEndTime = endTime
+		_, err = p.q(ctx).ExecContext(ctx, `INSERT INTO extension_applications (`+extAppCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+			app.ID, app.AuthorizationID, app.Plate, app.OriginalEndTime, app.NewEndTime, app.Reason, app.Applicant, app.Status, app.DecidedBy, app.DecidedAt, app.DecisionNote, app.CreatedAt, app.UpdatedAt)
+		if err != nil && isUniqueViolation(err) {
+			return ErrConflict
+		}
+		return err
+	})
+}
+func (p *Postgres) GetExtensionApplication(ctx context.Context, id string) (*model.ExtensionApplication, error) {
+	app := &model.ExtensionApplication{}
+	err := scanExtApp(p.q(ctx).QueryRowContext(ctx, `SELECT `+extAppCols+` FROM extension_applications WHERE id=$1`, id), app)
+	return app, mapNotFound(err)
+}
+// ApproveExtensionApplication updates the authorization end_time and the
+// application status in one SERIALIZABLE transaction, re-checking eligibility,
+// the 7-day cap and plate overlap (excluding the authorization being extended).
+// The audit log is inserted inside the same transaction so it commits atomically.
+func (p *Postgres) ApproveExtensionApplication(ctx context.Context, appID string, now time.Time, approver, note string) (*model.ExtensionApplication, *model.Authorization, error) {
+	var app *model.ExtensionApplication
+	var auth *model.Authorization
+	err := p.runTx(ctx, func(ctx context.Context) error {
+		var appStatus, authID, plate string
+		var newEnd, origEnd time.Time
+		err := p.q(ctx).QueryRowContext(ctx, `SELECT status,authorization_id,new_end_time,original_end_time,plate FROM extension_applications WHERE id=$1 FOR UPDATE`, appID).
+			Scan(&appStatus, &authID, &newEnd, &origEnd, &plate)
+		if err != nil {
+			return mapNotFound(err)
+		}
+		if appStatus != model.ExtStatusPending {
+			return ErrStatusTransition
+		}
+		var aStatus string
+		var aStart, aEnd time.Time
+		err = p.q(ctx).QueryRowContext(ctx, `SELECT status,start_time,end_time FROM authorizations WHERE id=$1 AND archived_at IS NULL FOR UPDATE`, authID).
+			Scan(&aStatus, &aStart, &aEnd)
+		if err != nil {
+			return mapNotFound(err)
+		}
+		if !model.ExtensibleAuth(aStatus, aEnd, now) {
+			return ErrNotExtensible
+		}
+		if !newEnd.After(aEnd) {
+			return fmt.Errorf("%w: new end time must be later than current authorization end time", ErrConflict)
+		}
+		if newEnd.Sub(aStart) > model.MaxAuthDuration {
+			return fmt.Errorf("%w: total authorization duration must not exceed 7 days", ErrConflict)
+		}
+		var n int64
+		if err := p.q(ctx).QueryRowContext(ctx, `SELECT count(*) FROM authorizations WHERE plate=$1 AND archived_at IS NULL AND status IN ('pending','active') AND id<>$2 AND start_time < $3 AND end_time > $4`, plate, authID, newEnd, aStart).Scan(&n); err != nil {
+			return err
+		}
+		if n > 0 {
+			return ErrConflict
+		}
+		if _, err := p.q(ctx).ExecContext(ctx, `UPDATE authorizations SET end_time=$1,updated_at=$2 WHERE id=$3`, newEnd, now, authID); err != nil {
+			return err
+		}
+		if _, err := p.q(ctx).ExecContext(ctx, `UPDATE extension_applications SET status='approved',decided_by=$1,decided_at=$2,decision_note=$3,updated_at=$4 WHERE id=$5`, approver, now, note, now, appID); err != nil {
+			return err
+		}
+		if _, err := p.q(ctx).ExecContext(ctx, `INSERT INTO audit_logs (id,action,entity_type,entity_id,operator,detail,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+			NewID("log"), "extension.approve", "extension_application", appID, approver,
+			fmt.Sprintf("approved; authorization %s end_time extended to %s", authID, newEnd.Format(time.RFC3339)), now); err != nil {
+			return err
+		}
+		if app, err = p.GetExtensionApplication(ctx, appID); err != nil {
+			return err
+		}
+		auth, err = p.GetAuthorization(ctx, authID)
+		return err
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return app, auth, nil
+}
+func (p *Postgres) RejectExtensionApplication(ctx context.Context, appID string, now time.Time, approver, reason string) (*model.ExtensionApplication, error) {
+	err := p.runTx(ctx, func(ctx context.Context) error {
+		var status string
+		err := p.q(ctx).QueryRowContext(ctx, `SELECT status FROM extension_applications WHERE id=$1 FOR UPDATE`, appID).Scan(&status)
+		if err != nil {
+			return mapNotFound(err)
+		}
+		if status != model.ExtStatusPending {
+			return ErrStatusTransition
+		}
+		_, err = p.q(ctx).ExecContext(ctx, `UPDATE extension_applications SET status='rejected',decided_by=$1,decided_at=$2,decision_note=$3,updated_at=$4 WHERE id=$5`, approver, now, reason, now, appID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return p.GetExtensionApplication(ctx, appID)
+}
+func (p *Postgres) RevokeExtensionApplication(ctx context.Context, appID string, now time.Time, operator, reason string) (*model.ExtensionApplication, error) {
+	err := p.runTx(ctx, func(ctx context.Context) error {
+		var status string
+		err := p.q(ctx).QueryRowContext(ctx, `SELECT status FROM extension_applications WHERE id=$1 FOR UPDATE`, appID).Scan(&status)
+		if err != nil {
+			return mapNotFound(err)
+		}
+		if status != model.ExtStatusPending {
+			return ErrStatusTransition
+		}
+		_, err = p.q(ctx).ExecContext(ctx, `UPDATE extension_applications SET status='revoked',decided_by=$1,decided_at=$2,decision_note=$3,updated_at=$4 WHERE id=$5`, operator, now, reason, now, appID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return p.GetExtensionApplication(ctx, appID)
+}
+func (p *Postgres) ListExtensionApplications(ctx context.Context, f model.ExtensionAppFilter) ([]*model.ExtensionApplication, int64, error) {
+	var sb strings.Builder
+	args := []interface{}{}
+	sb.WriteString(`SELECT count(*) OVER(),` + extAppCols + ` FROM extension_applications WHERE 1=1`)
+	n := 1
+	add := func(cond string, arg interface{}) {
+		sb.WriteString(fmt.Sprintf(cond, n))
+		args = append(args, arg)
+		n++
+	}
+	if f.AuthorizationID != "" {
+		add(" AND authorization_id=$%d", f.AuthorizationID)
+	}
+	if f.Plate != "" {
+		add(" AND plate=$%d", f.Plate)
+	}
+	if f.Status != "" {
+		add(" AND status=$%d", f.Status)
+	}
+	if f.Applicant != "" {
+		add(" AND applicant=$%d", f.Applicant)
+	}
+	sb.WriteString(" ORDER BY created_at DESC")
+	page := normPage(f.Page)
+	sb.WriteString(fmt.Sprintf(" LIMIT $%d OFFSET $%d", n, n+1))
+	args = append(args, page.Limit, page.Offset)
+	rows, err := p.db.QueryContext(ctx, sb.String(), args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []*model.ExtensionApplication
+	var total int64
+	for rows.Next() {
+		app := &model.ExtensionApplication{}
+		if err := rows.Scan(&total, &app.ID, &app.AuthorizationID, &app.Plate, &app.OriginalEndTime, &app.NewEndTime, &app.Reason, &app.Applicant, &app.Status, &app.DecidedBy, &app.DecidedAt, &app.DecisionNote, &app.CreatedAt, &app.UpdatedAt); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, app)
+	}
+	return out, total, rows.Err()
 }
