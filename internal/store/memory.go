@@ -1,4 +1,5 @@
 package store
+
 import (
 	"context"
 	"fmt"
@@ -7,6 +8,7 @@ import (
 	"time"
 	"visitor-parking/internal/model"
 )
+
 type Memory struct {
 	mu        sync.Mutex
 	residents map[string]*model.Resident
@@ -17,6 +19,7 @@ type Memory struct {
 	extApps   map[string]*model.ExtensionApplication
 	logs      map[string]*model.AuditLog
 }
+
 func NewMemory() *Memory {
 	return &Memory{
 		residents: make(map[string]*model.Resident),
@@ -583,6 +586,7 @@ func (m *Memory) GetExtensionApplication(ctx context.Context, id string) (*model
 	}
 	return cloneExtApp(app), nil
 }
+
 // ApproveExtensionApplication mutates the authorization's end_time and the
 // application status under the same lock, re-checking eligibility, the 7-day
 // cap and plate overlap. The audit log is written here (within the logical
@@ -614,7 +618,10 @@ func (m *Memory) ApproveExtensionApplication(ctx context.Context, appID string, 
 		if ex.ArchivedAt != nil || ex.ID == a.ID || ex.Plate != a.Plate {
 			continue
 		}
-		if ex.Status == model.AuthStatusCompleted || ex.Status == model.AuthStatusCancelled {
+		if ex.Status != model.AuthStatusPending && ex.Status != model.AuthStatusActive {
+			continue
+		}
+		if ex.Status == model.AuthStatusPending && !now.Before(ex.EndTime) {
 			continue
 		}
 		if a.StartTime.Before(ex.EndTime) && ex.StartTime.Before(app.NewEndTime) {

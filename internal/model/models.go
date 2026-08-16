@@ -1,5 +1,7 @@
 package model
+
 import "time"
+
 // MaxAuthDuration caps any single authorization's total validity window.
 // Shared by service (validation) and store (defensive re-checks).
 const MaxAuthDuration = 7 * 24 * time.Hour
@@ -18,6 +20,7 @@ const (
 	ResidentActive   = "active"
 	ResidentDisabled = "disabled"
 )
+
 // Extension application statuses.
 const (
 	ExtStatusPending  = "pending"  // 待审批
@@ -25,19 +28,17 @@ const (
 	ExtStatusRejected = "rejected" // 已驳回
 	ExtStatusRevoked  = "revoked"  // 已撤销
 )
-// ExtensibleAuth reports whether an authorization may still be extended:
-// active authorizations always qualify (vehicle still on premises); pending
-// ones qualify only while inside their validity window (not yet expired).
-// Completed, cancelled and (derived) expired authorizations are not extensible.
+
+// ExtensibleAuth reports whether a pending or active authorization remains
+// inside its validity window. Once end_time is reached it cannot be extended,
+// even if its persisted status has not yet caught up with the clock.
 func ExtensibleAuth(status string, endTime time.Time, now time.Time) bool {
 	if status != AuthStatusPending && status != AuthStatusActive {
 		return false
 	}
-	if status == AuthStatusPending && !now.Before(endTime) {
-		return false
-	}
-	return true
+	return now.Before(endTime)
 }
+
 type Page struct {
 	Limit  int
 	Offset int
@@ -136,6 +137,7 @@ type AreaOccupancy struct {
 	Available   int     `json:"available"`
 	Utilization float64 `json:"utilization"` // occupied / capacity
 }
+
 // ExtensionApplication is a property-staff request to push an authorization's
 // end_time later. Only one pending application may exist per authorization.
 type ExtensionApplication struct {
@@ -144,15 +146,16 @@ type ExtensionApplication struct {
 	Plate           string     `json:"plate"`
 	OriginalEndTime time.Time  `json:"original_end_time"`
 	NewEndTime      time.Time  `json:"new_end_time"`
-	Reason          string     `json:"reason"`        // 延期原因（申请人填写）
-	Applicant       string     `json:"applicant"`     // 申请人
-	Status          string     `json:"status"`        // pending|approved|rejected|revoked
-	DecidedBy       string     `json:"decided_by,omitempty"`     // 审批人/驳回人/撤销人
-	DecidedAt       *time.Time `json:"decided_at,omitempty"`     // 审批/决策时间
-	DecisionNote    string     `json:"decision_note,omitempty"`  // 审批备注/驳回原因/撤销原因
+	Reason          string     `json:"reason"`                  // 延期原因（申请人填写）
+	Applicant       string     `json:"applicant"`               // 申请人
+	Status          string     `json:"status"`                  // pending|approved|rejected|revoked
+	DecidedBy       string     `json:"decided_by,omitempty"`    // 审批人/驳回人/撤销人
+	DecidedAt       *time.Time `json:"decided_at,omitempty"`    // 审批/决策时间
+	DecisionNote    string     `json:"decision_note,omitempty"` // 审批备注/驳回原因/撤销原因
 	CreatedAt       time.Time  `json:"created_at"`
 	UpdatedAt       time.Time  `json:"updated_at"` // also used as optimistic-lock version token
 }
+
 // ExtensionAppFilter scopes the paginated extension-application query.
 type ExtensionAppFilter struct {
 	AuthorizationID string

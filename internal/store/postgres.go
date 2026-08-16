@@ -1,15 +1,18 @@
 package store
+
 import (
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	_ "github.com/lib/pq"
 	"strings"
 	"time"
-	_ "github.com/lib/pq"
 	"visitor-parking/internal/model"
 )
+
 type Postgres struct{ db *sql.DB }
+
 func NewPostgres(dsn string) (*Postgres, error) {
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -25,6 +28,7 @@ func NewPostgres(dsn string) (*Postgres, error) {
 }
 func (p *Postgres) Close() error { return p.db.Close() }
 func (p *Postgres) DB() *sql.DB  { return p.db }
+
 type txKey struct{}
 type scanner interface {
 	Scan(dest ...interface{}) error
@@ -34,6 +38,7 @@ type querier interface {
 	QueryRowContext(ctx context.Context, q string, args ...interface{}) *sql.Row
 	QueryContext(ctx context.Context, q string, args ...interface{}) (*sql.Rows, error)
 }
+
 func (p *Postgres) q(ctx context.Context) querier {
 	if v, ok := ctx.Value(txKey{}).(querier); ok {
 		return v
@@ -92,7 +97,9 @@ func scanRecord(s scanner, r *model.EntryExitRecord) error {
 func scanExtApp(s scanner, a *model.ExtensionApplication) error {
 	return s.Scan(&a.ID, &a.AuthorizationID, &a.Plate, &a.OriginalEndTime, &a.NewEndTime, &a.Reason, &a.Applicant, &a.Status, &a.DecidedBy, &a.DecidedAt, &a.DecisionNote, &a.CreatedAt, &a.UpdatedAt)
 }
+
 const residentCols = "id,name,phone,building,unit,room,status,archived_at,created_at,updated_at"
+
 func (p *Postgres) CreateResident(ctx context.Context, r *model.Resident) error {
 	_, err := p.q(ctx).ExecContext(ctx, `INSERT INTO residents (`+residentCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 		r.ID, r.Name, r.Phone, r.Building, r.Unit, r.Room, r.Status, r.ArchivedAt, r.CreatedAt, r.UpdatedAt)
@@ -140,7 +147,9 @@ func wrap(res sql.Result, err error, fail error) error {
 	}
 	return checkRows(res, fail)
 }
+
 const vehicleCols = "id,plate,owner_name,owner_phone,color,archived_at,created_at,updated_at"
+
 func (p *Postgres) CreateVehicle(ctx context.Context, v *model.Vehicle) error {
 	_, err := p.q(ctx).ExecContext(ctx, `INSERT INTO vehicles (`+vehicleCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
 		v.ID, v.Plate, v.OwnerName, v.OwnerPhone, v.Color, v.ArchivedAt, v.CreatedAt, v.UpdatedAt)
@@ -186,7 +195,9 @@ func (p *Postgres) ListVehicles(ctx context.Context, page model.Page) ([]*model.
 	}
 	return out, total, rows.Err()
 }
+
 const areaCols = "id,name,code,capacity,archived_at,created_at,updated_at"
+
 func (p *Postgres) CreateParkingArea(ctx context.Context, a *model.ParkingArea) error {
 	_, err := p.q(ctx).ExecContext(ctx, `INSERT INTO parking_areas (`+areaCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
 		a.ID, a.Name, a.Code, a.Capacity, a.ArchivedAt, a.CreatedAt, a.UpdatedAt)
@@ -227,7 +238,9 @@ func (p *Postgres) ListParkingAreas(ctx context.Context, page model.Page) ([]*mo
 	}
 	return out, total, rows.Err()
 }
+
 const authCols = "id,resident_id,plate,parking_area_id,start_time,end_time,status,purpose,created_by,archived_at,created_at,updated_at"
+
 func (p *Postgres) CreateAuthorization(ctx context.Context, a *model.Authorization, now time.Time) error {
 	return p.runTx(ctx, func(ctx context.Context) error {
 		var status string
@@ -329,7 +342,9 @@ func (p *Postgres) ListAuthorizations(ctx context.Context, f model.AuthFilter) (
 	}
 	return out, total, rows.Err()
 }
+
 const recordCols = "id,authorization_id,plate,parking_area_id,entry_time,exit_time,exit_operator,exit_note,status,created_at,updated_at"
+
 func (p *Postgres) CreateRecord(ctx context.Context, r *model.EntryExitRecord) error {
 	_, err := p.q(ctx).ExecContext(ctx, `INSERT INTO entry_exit_records (`+recordCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
 		r.ID, r.AuthorizationID, r.Plate, r.ParkingAreaID, r.EntryTime, r.ExitTime, r.ExitOperator, r.ExitNote, r.Status, r.CreatedAt, r.UpdatedAt)
@@ -519,7 +534,9 @@ func (p *Postgres) RevokeAuthorization(ctx context.Context, authID string, now t
 	}
 	return p.GetAuthorization(ctx, authID)
 }
+
 const extAppCols = "id,authorization_id,plate,original_end_time,new_end_time,reason,applicant,status,decided_by,decided_at,decision_note,created_at,updated_at"
+
 func (p *Postgres) CreateExtensionApplication(ctx context.Context, app *model.ExtensionApplication, now time.Time) error {
 	return p.runTx(ctx, func(ctx context.Context) error {
 		var plate, status string
@@ -554,6 +571,7 @@ func (p *Postgres) GetExtensionApplication(ctx context.Context, id string) (*mod
 	err := scanExtApp(p.q(ctx).QueryRowContext(ctx, `SELECT `+extAppCols+` FROM extension_applications WHERE id=$1`, id), app)
 	return app, mapNotFound(err)
 }
+
 // ApproveExtensionApplication updates the authorization end_time and the
 // application status in one SERIALIZABLE transaction, re-checking eligibility,
 // the 7-day cap and plate overlap (excluding the authorization being extended).
@@ -589,7 +607,7 @@ func (p *Postgres) ApproveExtensionApplication(ctx context.Context, appID string
 			return fmt.Errorf("%w: total authorization duration must not exceed 7 days", ErrConflict)
 		}
 		var n int64
-		if err := p.q(ctx).QueryRowContext(ctx, `SELECT count(*) FROM authorizations WHERE plate=$1 AND archived_at IS NULL AND status IN ('pending','active') AND id<>$2 AND start_time < $3 AND end_time > $4`, plate, authID, newEnd, aStart).Scan(&n); err != nil {
+		if err := p.q(ctx).QueryRowContext(ctx, `SELECT count(*) FROM authorizations WHERE plate=$1 AND archived_at IS NULL AND status IN ('pending','active') AND id<>$2 AND start_time < $3 AND end_time > $4 AND (status='active' OR end_time > $5)`, plate, authID, newEnd, aStart, now).Scan(&n); err != nil {
 			return err
 		}
 		if n > 0 {

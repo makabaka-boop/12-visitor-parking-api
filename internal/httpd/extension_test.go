@@ -1,11 +1,15 @@
 package httpd
+
 import (
 	"encoding/json"
 	"net/http"
 	"testing"
 	"time"
 	"visitor-parking/internal/model"
+	"visitor-parking/internal/service"
+	"visitor-parking/internal/store"
 )
+
 // mustAuthHTTP creates an authorization with the given plate and window,
 // returning its id. start/end are offsets from baseTime.
 func mustAuthHTTP(t *testing.T, h http.Handler, plate string, startOff, dur time.Duration) string {
@@ -49,7 +53,7 @@ func mustCreateExtension(t *testing.T, h http.Handler, authID, newEnd, reason, a
 }
 func TestCreateExtension_HappyPath(t *testing.T) {
 	h, _ := newServer(t, 0)
-	authID := seed(t, h) // start=10:00 end=15:00
+	authID := seed(t, h)                                         // start=10:00 end=15:00
 	newEnd := baseTime().Add(7 * time.Hour).Format(time.RFC3339) // 17:00, total 7h <= 7d
 	appID := mustCreateExtension(t, h, authID, newEnd, "访客需多停留", "物业小王")
 	resp, data := doJSON(t, h, http.MethodGet, "/api/v1/extension-applications/"+appID, nil)
@@ -131,6 +135,30 @@ func TestCreateExtension_CancelledAuthRejected(t *testing.T) {
 		t.Fatalf("cancelled auth extend status=%d want 409", resp.StatusCode)
 	}
 }
+
+func TestCreateExtension_ExpiredActiveAuthRejected(t *testing.T) {
+	now := baseTime()
+	st := store.NewMemory()
+	svc := service.NewWithClock(st, func() time.Time { return now })
+	h := NewHandler(svc).Routes()
+	authID := seed(t, h)
+
+	resp, data := doJSON(t, h, http.MethodPost, "/api/v1/authorizations/"+authID+"/entry", nil)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("entry status=%d body=%s", resp.StatusCode, string(data))
+	}
+	now = baseTime().Add(6 * time.Hour)
+	resp, data = doJSON(t, h, http.MethodPost, "/api/v1/extension-applications", map[string]interface{}{
+		"authorization_id": authID,
+		"new_end_time":     baseTime().Add(7 * time.Hour).Format(time.RFC3339),
+		"reason":           "visitor needs more time",
+		"applicant":        "manager",
+	})
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expired active auth extension status=%d want 409 body=%s", resp.StatusCode, string(data))
+	}
+}
+
 func TestCreateExtension_DuplicatePendingConflict(t *testing.T) {
 	h, _ := newServer(t, 0)
 	authID := seed(t, h)
@@ -155,7 +183,7 @@ func TestApproveExtension_UpdatesAuthAndAudits(t *testing.T) {
 	}
 	var env struct {
 		Data struct {
-			Application  *model.ExtensionApplication `json:"application"`
+			Application   *model.ExtensionApplication `json:"application"`
 			Authorization *model.Authorization        `json:"authorization"`
 		} `json:"data"`
 	}
@@ -291,7 +319,7 @@ func TestListExtensionApplications_FilterAndPage(t *testing.T) {
 	var env struct {
 		Data struct {
 			Items []*model.ExtensionApplication `json:"items"`
-			Total int                            `json:"total"`
+			Total int                           `json:"total"`
 		} `json:"data"`
 	}
 	json.Unmarshal(data, &env)
