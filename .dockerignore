@@ -1,0 +1,24 @@
+# build artifacts / tooling
+*.out
+*.test
+/bin/
+/dist/
+*.exe
+
+# local env / secrets
+.env
+.env.*
+!.env.example
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+*~
+
+# Go test coverage & cache
+coverage.txt
+coverage.html
+
+# Docker intermediate (not committed, but harmless if present)
+*.log
