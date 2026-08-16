@@ -1,15 +1,18 @@
 package store
+
 import (
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	_ "github.com/lib/pq"
 	"strings"
 	"time"
-	_ "github.com/lib/pq"
 	"visitor-parking/internal/model"
 )
+
 type Postgres struct{ db *sql.DB }
+
 func NewPostgres(dsn string) (*Postgres, error) {
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -25,6 +28,7 @@ func NewPostgres(dsn string) (*Postgres, error) {
 }
 func (p *Postgres) Close() error { return p.db.Close() }
 func (p *Postgres) DB() *sql.DB  { return p.db }
+
 type txKey struct{}
 type scanner interface {
 	Scan(dest ...interface{}) error
@@ -34,6 +38,7 @@ type querier interface {
 	QueryRowContext(ctx context.Context, q string, args ...interface{}) *sql.Row
 	QueryContext(ctx context.Context, q string, args ...interface{}) (*sql.Rows, error)
 }
+
 func (p *Postgres) q(ctx context.Context) querier {
 	if v, ok := ctx.Value(txKey{}).(querier); ok {
 		return v
@@ -89,7 +94,17 @@ func scanAuth(s scanner, a *model.Authorization) error {
 func scanRecord(s scanner, r *model.EntryExitRecord) error {
 	return s.Scan(&r.ID, &r.AuthorizationID, &r.Plate, &r.ParkingAreaID, &r.EntryTime, &r.ExitTime, &r.ExitOperator, &r.ExitNote, &r.Status, &r.CreatedAt, &r.UpdatedAt)
 }
+func scanBillingRule(s scanner, r *model.BillingRule) error {
+	return s.Scan(&r.ID, &r.ParkingAreaID, &r.FreeMinutes, &r.HourlyRateCents, &r.DailyCapCents, &r.EffectiveFrom, &r.Status, &r.ArchivedAt, &r.CreatedAt, &r.UpdatedAt)
+}
+func scanFee(s scanner, f *model.Fee) error {
+	return s.Scan(&f.ID, &f.RecordID, &f.AuthorizationID, &f.Plate, &f.ParkingAreaID, &f.BillingRuleID, &f.EntryTime, &f.ExitTime, &f.DurationMinutes, &f.ChargedMinutes, &f.AmountCents, &f.Status, &f.SettleMethod, &f.SettleReason, &f.SettleOperator, &f.SettledAt, &f.CreatedAt, &f.UpdatedAt)
+}
+
+const billingRuleCols = "id,parking_area_id,free_minutes,hourly_rate_cents,daily_cap_cents,effective_from,status,archived_at,created_at,updated_at"
+const feeCols = "id,record_id,authorization_id,plate,parking_area_id,billing_rule_id,entry_time,exit_time,duration_minutes,charged_minutes,amount_cents,status,settle_method,settle_reason,settle_operator,settled_at,created_at,updated_at"
 const residentCols = "id,name,phone,building,unit,room,status,archived_at,created_at,updated_at"
+
 func (p *Postgres) CreateResident(ctx context.Context, r *model.Resident) error {
 	_, err := p.q(ctx).ExecContext(ctx, `INSERT INTO residents (`+residentCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 		r.ID, r.Name, r.Phone, r.Building, r.Unit, r.Room, r.Status, r.ArchivedAt, r.CreatedAt, r.UpdatedAt)
@@ -137,7 +152,9 @@ func wrap(res sql.Result, err error, fail error) error {
 	}
 	return checkRows(res, fail)
 }
+
 const vehicleCols = "id,plate,owner_name,owner_phone,color,archived_at,created_at,updated_at"
+
 func (p *Postgres) CreateVehicle(ctx context.Context, v *model.Vehicle) error {
 	_, err := p.q(ctx).ExecContext(ctx, `INSERT INTO vehicles (`+vehicleCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
 		v.ID, v.Plate, v.OwnerName, v.OwnerPhone, v.Color, v.ArchivedAt, v.CreatedAt, v.UpdatedAt)
@@ -183,7 +200,9 @@ func (p *Postgres) ListVehicles(ctx context.Context, page model.Page) ([]*model.
 	}
 	return out, total, rows.Err()
 }
+
 const areaCols = "id,name,code,capacity,archived_at,created_at,updated_at"
+
 func (p *Postgres) CreateParkingArea(ctx context.Context, a *model.ParkingArea) error {
 	_, err := p.q(ctx).ExecContext(ctx, `INSERT INTO parking_areas (`+areaCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
 		a.ID, a.Name, a.Code, a.Capacity, a.ArchivedAt, a.CreatedAt, a.UpdatedAt)
@@ -224,7 +243,9 @@ func (p *Postgres) ListParkingAreas(ctx context.Context, page model.Page) ([]*mo
 	}
 	return out, total, rows.Err()
 }
+
 const authCols = "id,resident_id,plate,parking_area_id,start_time,end_time,status,purpose,created_by,archived_at,created_at,updated_at"
+
 func (p *Postgres) CreateAuthorization(ctx context.Context, a *model.Authorization, now time.Time) error {
 	return p.runTx(ctx, func(ctx context.Context) error {
 		var status string
@@ -326,7 +347,9 @@ func (p *Postgres) ListAuthorizations(ctx context.Context, f model.AuthFilter) (
 	}
 	return out, total, rows.Err()
 }
+
 const recordCols = "id,authorization_id,plate,parking_area_id,entry_time,exit_time,exit_operator,exit_note,status,created_at,updated_at"
+
 func (p *Postgres) CreateRecord(ctx context.Context, r *model.EntryExitRecord) error {
 	_, err := p.q(ctx).ExecContext(ctx, `INSERT INTO entry_exit_records (`+recordCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
 		r.ID, r.AuthorizationID, r.Plate, r.ParkingAreaID, r.EntryTime, r.ExitTime, r.ExitOperator, r.ExitNote, r.Status, r.CreatedAt, r.UpdatedAt)
@@ -469,8 +492,9 @@ func (p *Postgres) EnterVehicle(ctx context.Context, authID string, now time.Tim
 	})
 	return rec, err
 }
-func (p *Postgres) ExitVehicle(ctx context.Context, authID string, now time.Time, operator, note string) (*model.EntryExitRecord, error) {
+func (p *Postgres) ExitVehicle(ctx context.Context, authID string, now time.Time, operator, note string) (*model.EntryExitRecord, *model.Fee, error) {
 	var recID string
+	var fee *model.Fee
 	err := p.runTx(ctx, func(ctx context.Context) error {
 		var status string
 		if err := p.q(ctx).QueryRowContext(ctx, `SELECT status FROM authorizations WHERE id=$1 AND archived_at IS NULL FOR UPDATE`, authID).Scan(&status); err != nil {
@@ -482,19 +506,56 @@ func (p *Postgres) ExitVehicle(ctx context.Context, authID string, now time.Time
 		if status != model.AuthStatusActive {
 			return ErrStatusTransition
 		}
-		if err := p.q(ctx).QueryRowContext(ctx, `SELECT id FROM entry_exit_records WHERE authorization_id=$1 AND status='entered' FOR UPDATE`, authID).Scan(&recID); err != nil {
+		var plate, areaID string
+		var entryTime time.Time
+		if err := p.q(ctx).QueryRowContext(ctx, `SELECT id,plate,parking_area_id,entry_time FROM entry_exit_records WHERE authorization_id=$1 AND status='entered' FOR UPDATE`, authID).Scan(&recID, &plate, &areaID, &entryTime); err != nil {
 			return mapNotFound(err)
 		}
 		if _, err := p.q(ctx).ExecContext(ctx, `UPDATE entry_exit_records SET exit_time=$1,exit_operator=$2,exit_note=$3,status='exited',updated_at=$4 WHERE id=$5`, now, operator, note, now, recID); err != nil {
 			return err
 		}
-		_, err := p.q(ctx).ExecContext(ctx, `UPDATE authorizations SET status='completed',updated_at=$1 WHERE id=$2`, now, authID)
-		return err
+		if _, err := p.q(ctx).ExecContext(ctx, `UPDATE authorizations SET status='completed',updated_at=$1 WHERE id=$2`, now, authID); err != nil {
+			return err
+		}
+		// Fee generation within the same transaction as the exit and capacity
+		// release. Look up the rule effective at entry time; if none, skip.
+		rule := &model.BillingRule{}
+		err := scanBillingRule(p.q(ctx).QueryRowContext(ctx, `SELECT `+billingRuleCols+` FROM billing_rules WHERE parking_area_id=$1 AND archived_at IS NULL AND effective_from <= $2 ORDER BY effective_from DESC LIMIT 1`, areaID, entryTime), rule)
+		if err == nil {
+			charged, amount := ComputeFee(entryTime, now, rule.FreeMinutes, rule.HourlyRateCents, rule.DailyCapCents)
+			fee = &model.Fee{
+				ID:              NewID("fee"),
+				RecordID:        recID,
+				AuthorizationID: authID,
+				Plate:           plate,
+				ParkingAreaID:   areaID,
+				BillingRuleID:   rule.ID,
+				EntryTime:       entryTime,
+				ExitTime:        now,
+				DurationMinutes: MinutesCeil(entryTime, now),
+				ChargedMinutes:  charged,
+				AmountCents:     amount,
+				Status:          model.FeeStatusUnsettled,
+				CreatedAt:       now,
+				UpdatedAt:       now,
+			}
+			if _, err := p.q(ctx).ExecContext(ctx, `INSERT INTO fees (`+feeCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+				fee.ID, fee.RecordID, fee.AuthorizationID, fee.Plate, fee.ParkingAreaID, fee.BillingRuleID, fee.EntryTime, fee.ExitTime, fee.DurationMinutes, fee.ChargedMinutes, fee.AmountCents, fee.Status, fee.SettleMethod, fee.SettleReason, fee.SettleOperator, fee.SettledAt, fee.CreatedAt, fee.UpdatedAt); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return mapNotFound(err)
+		}
+		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return p.GetRecord(ctx, recID)
+	rec, err := p.GetRecord(ctx, recID)
+	if err != nil {
+		return nil, fee, err
+	}
+	return rec, fee, nil
 }
 func (p *Postgres) RevokeAuthorization(ctx context.Context, authID string, now time.Time, operator, reason string) (*model.Authorization, error) {
 	err := p.runTx(ctx, func(ctx context.Context) error {
@@ -515,4 +576,203 @@ func (p *Postgres) RevokeAuthorization(ctx context.Context, authID string, now t
 		return nil, err
 	}
 	return p.GetAuthorization(ctx, authID)
+}
+func (p *Postgres) CreateBillingRule(ctx context.Context, r *model.BillingRule) error {
+	return p.runTx(ctx, func(ctx context.Context) error {
+		var archived *time.Time
+		if err := p.q(ctx).QueryRowContext(ctx, `SELECT archived_at FROM parking_areas WHERE id=$1`, r.ParkingAreaID).Scan(&archived); err != nil {
+			return mapNotFound(err)
+		}
+		if archived != nil {
+			return ErrAreaArchived
+		}
+		_, err := p.q(ctx).ExecContext(ctx, `INSERT INTO billing_rules (`+billingRuleCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			r.ID, r.ParkingAreaID, r.FreeMinutes, r.HourlyRateCents, r.DailyCapCents, r.EffectiveFrom, r.Status, r.ArchivedAt, r.CreatedAt, r.UpdatedAt)
+		if err != nil && isUniqueViolation(err) {
+			return ErrConflict
+		}
+		return err
+	})
+}
+func (p *Postgres) GetBillingRule(ctx context.Context, id string) (*model.BillingRule, error) {
+	r := &model.BillingRule{}
+	err := scanBillingRule(p.q(ctx).QueryRowContext(ctx, `SELECT `+billingRuleCols+` FROM billing_rules WHERE id=$1 AND archived_at IS NULL`, id), r)
+	return r, mapNotFound(err)
+}
+func (p *Postgres) UpdateBillingRule(ctx context.Context, r *model.BillingRule) error {
+	res, err := p.q(ctx).ExecContext(ctx, `UPDATE billing_rules SET free_minutes=$1,hourly_rate_cents=$2,daily_cap_cents=$3,effective_from=$4,status=$5,updated_at=$6 WHERE id=$7 AND archived_at IS NULL AND updated_at=$8`,
+		r.FreeMinutes, r.HourlyRateCents, r.DailyCapCents, r.EffectiveFrom, r.Status, r.UpdatedAt, r.ID, r.UpdatedAt)
+	if err != nil && isUniqueViolation(err) {
+		return ErrConflict
+	}
+	return wrap(res, err, ErrConcurrentModify)
+}
+func (p *Postgres) ArchiveBillingRule(ctx context.Context, id string, now time.Time) error {
+	res, err := p.q(ctx).ExecContext(ctx, `UPDATE billing_rules SET archived_at=$1,status=$2,updated_at=$3 WHERE id=$4 AND archived_at IS NULL`, now, model.BillingRuleArchived, now, id)
+	return wrap(res, err, ErrNotFound)
+}
+func (p *Postgres) ListBillingRules(ctx context.Context, f BillingRuleFilter) ([]*model.BillingRule, int64, error) {
+	var sb strings.Builder
+	args := []interface{}{}
+	sb.WriteString(`SELECT count(*) OVER(),` + billingRuleCols + ` FROM billing_rules WHERE archived_at IS NULL`)
+	n := 1
+	add := func(cond string, arg interface{}) {
+		sb.WriteString(fmt.Sprintf(cond, n))
+		args = append(args, arg)
+		n++
+	}
+	if f.ParkingAreaID != "" {
+		add(" AND parking_area_id=$%d", f.ParkingAreaID)
+	}
+	if f.Status != "" {
+		add(" AND status=$%d", f.Status)
+	}
+	sb.WriteString(" ORDER BY effective_from DESC")
+	page := normPage(f.Page)
+	sb.WriteString(fmt.Sprintf(" LIMIT $%d OFFSET $%d", n, n+1))
+	args = append(args, page.Limit, page.Offset)
+	rows, err := p.db.QueryContext(ctx, sb.String(), args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []*model.BillingRule
+	var total int64
+	for rows.Next() {
+		r := &model.BillingRule{}
+		if err := rows.Scan(&total, &r.ID, &r.ParkingAreaID, &r.FreeMinutes, &r.HourlyRateCents, &r.DailyCapCents, &r.EffectiveFrom, &r.Status, &r.ArchivedAt, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, r)
+	}
+	return out, total, rows.Err()
+}
+func (p *Postgres) ActiveBillingRule(ctx context.Context, areaID string, at time.Time) (*model.BillingRule, error) {
+	r := &model.BillingRule{}
+	err := scanBillingRule(p.q(ctx).QueryRowContext(ctx, `SELECT `+billingRuleCols+` FROM billing_rules WHERE parking_area_id=$1 AND archived_at IS NULL AND effective_from <= $2 ORDER BY effective_from DESC LIMIT 1`, areaID, at), r)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil // no applicable rule
+	}
+	return r, mapNotFound(err)
+}
+func (p *Postgres) CreateFee(ctx context.Context, f *model.Fee) error {
+	_, err := p.q(ctx).ExecContext(ctx, `INSERT INTO fees (`+feeCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+		f.ID, f.RecordID, f.AuthorizationID, f.Plate, f.ParkingAreaID, f.BillingRuleID, f.EntryTime, f.ExitTime, f.DurationMinutes, f.ChargedMinutes, f.AmountCents, f.Status, f.SettleMethod, f.SettleReason, f.SettleOperator, f.SettledAt, f.CreatedAt, f.UpdatedAt)
+	if err != nil && isUniqueViolation(err) {
+		return ErrConflict
+	}
+	return err
+}
+func (p *Postgres) GetFee(ctx context.Context, id string) (*model.Fee, error) {
+	f := &model.Fee{}
+	err := scanFee(p.q(ctx).QueryRowContext(ctx, `SELECT `+feeCols+` FROM fees WHERE id=$1`, id), f)
+	return f, mapNotFound(err)
+}
+func (p *Postgres) ListFees(ctx context.Context, f FeeFilter) ([]*model.Fee, int64, error) {
+	var sb strings.Builder
+	args := []interface{}{}
+	sb.WriteString(`SELECT count(*) OVER(),` + feeCols + ` FROM fees WHERE 1=1`)
+	n := 1
+	add := func(cond string, arg interface{}) {
+		sb.WriteString(fmt.Sprintf(cond, n))
+		args = append(args, arg)
+		n++
+	}
+	if f.AreaID != "" {
+		add(" AND parking_area_id=$%d", f.AreaID)
+	}
+	if f.Plate != "" {
+		add(" AND plate=$%d", f.Plate)
+	}
+	if f.RecordID != "" {
+		add(" AND record_id=$%d", f.RecordID)
+	}
+	if f.Status != "" {
+		add(" AND status=$%d", f.Status)
+	}
+	sb.WriteString(" ORDER BY exit_time DESC")
+	page := normPage(f.Page)
+	sb.WriteString(fmt.Sprintf(" LIMIT $%d OFFSET $%d", n, n+1))
+	args = append(args, page.Limit, page.Offset)
+	rows, err := p.db.QueryContext(ctx, sb.String(), args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []*model.Fee
+	var total int64
+	for rows.Next() {
+		fee := &model.Fee{}
+		if err := rows.Scan(&total, &fee.ID, &fee.RecordID, &fee.AuthorizationID, &fee.Plate, &fee.ParkingAreaID, &fee.BillingRuleID, &fee.EntryTime, &fee.ExitTime, &fee.DurationMinutes, &fee.ChargedMinutes, &fee.AmountCents, &fee.Status, &fee.SettleMethod, &fee.SettleReason, &fee.SettleOperator, &fee.SettledAt, &fee.CreatedAt, &fee.UpdatedAt); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, fee)
+	}
+	return out, total, rows.Err()
+}
+func (p *Postgres) SettleFee(ctx context.Context, id, method, reason, operator string, now time.Time) (*model.Fee, error) {
+	err := p.runTx(ctx, func(ctx context.Context) error {
+		res, err := p.q(ctx).ExecContext(ctx, `UPDATE fees SET status='settled',settle_method=$1,settle_reason=$2,settle_operator=$3,settled_at=$4,updated_at=$5 WHERE id=$6 AND status='unsettled'`,
+			method, reason, operator, now, now, id)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			// Either the fee does not exist or it was already settled; the
+			// SettleFee call uses an atomic conditional UPDATE, so concurrent
+			// settle attempts cannot both succeed.
+			var status string
+			if err := p.q(ctx).QueryRowContext(ctx, `SELECT status FROM fees WHERE id=$1`, id).Scan(&status); err != nil {
+				return mapNotFound(err)
+			}
+			return ErrAlreadySettled
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return p.GetFee(ctx, id)
+}
+func (p *Postgres) AreaRevenue(ctx context.Context, f AreaRevenueFilter) ([]*model.AreaRevenue, error) {
+	var sb strings.Builder
+	args := []interface{}{}
+	sb.WriteString(`SELECT a.id,a.name,a.code, COUNT(f.id), COUNT(f.id) FILTER (WHERE f.status='settled'), COUNT(f.id) FILTER (WHERE f.status='unsettled'), COALESCE(SUM(f.amount_cents) FILTER (WHERE f.status='settled'),0), COALESCE(SUM(f.amount_cents) FILTER (WHERE f.status='unsettled'),0) FROM parking_areas a LEFT JOIN fees f ON f.parking_area_id=a.id`)
+	n := 1
+	if f.From != nil {
+		sb.WriteString(fmt.Sprintf(" AND f.exit_time >= $%d", n))
+		args = append(args, *f.From)
+		n++
+	}
+	if f.To != nil {
+		sb.WriteString(fmt.Sprintf(" AND f.exit_time < $%d", n))
+		args = append(args, *f.To)
+		n++
+	}
+	sb.WriteString(" WHERE a.archived_at IS NULL")
+	if f.AreaID != "" {
+		sb.WriteString(fmt.Sprintf(" AND a.id=$%d", n))
+		args = append(args, f.AreaID)
+		n++
+	}
+	sb.WriteString(" GROUP BY a.id,a.name,a.code ORDER BY a.name")
+	rows, err := p.db.QueryContext(ctx, sb.String(), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.AreaRevenue
+	for rows.Next() {
+		o := &model.AreaRevenue{}
+		if err := rows.Scan(&o.AreaID, &o.AreaName, &o.Code, &o.FeeCount, &o.SettledCount, &o.UnsettledCount, &o.SettledCents, &o.UnsettledCents); err != nil {
+			return nil, err
+		}
+		o.TotalCents = o.SettledCents + o.UnsettledCents
+		out = append(out, o)
+	}
+	return out, rows.Err()
 }

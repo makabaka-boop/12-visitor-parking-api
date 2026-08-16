@@ -1,4 +1,5 @@
 package store
+
 import (
 	"context"
 	"fmt"
@@ -7,6 +8,7 @@ import (
 	"time"
 	"visitor-parking/internal/model"
 )
+
 type Memory struct {
 	mu        sync.Mutex
 	residents map[string]*model.Resident
@@ -15,7 +17,10 @@ type Memory struct {
 	auths     map[string]*model.Authorization
 	records   map[string]*model.EntryExitRecord
 	logs      map[string]*model.AuditLog
+	rules     map[string]*model.BillingRule
+	fees      map[string]*model.Fee
 }
+
 func NewMemory() *Memory {
 	return &Memory{
 		residents: make(map[string]*model.Resident),
@@ -24,6 +29,8 @@ func NewMemory() *Memory {
 		auths:     make(map[string]*model.Authorization),
 		records:   make(map[string]*model.EntryExitRecord),
 		logs:      make(map[string]*model.AuditLog),
+		rules:     make(map[string]*model.BillingRule),
+		fees:      make(map[string]*model.Fee),
 	}
 }
 func clonePtr(t *time.Time) *time.Time {
@@ -56,6 +63,22 @@ func cloneAuth(a *model.Authorization) *model.Authorization {
 func cloneRecord(r *model.EntryExitRecord) *model.EntryExitRecord {
 	c := *r
 	c.ExitTime = clonePtr(r.ExitTime)
+	return &c
+}
+func cloneRule(r *model.BillingRule) *model.BillingRule {
+	if r == nil {
+		return nil
+	}
+	c := *r
+	c.ArchivedAt = clonePtr(r.ArchivedAt)
+	return &c
+}
+func cloneFee(f *model.Fee) *model.Fee {
+	if f == nil {
+		return nil
+	}
+	c := *f
+	c.SettledAt = clonePtr(f.SettledAt)
 	return &c
 }
 func normPage(p model.Page) model.Page {
@@ -494,18 +517,18 @@ func (m *Memory) EnterVehicle(ctx context.Context, authID string, now time.Time)
 	m.auths[authID] = cloneAuth(a)
 	return rec, nil
 }
-func (m *Memory) ExitVehicle(ctx context.Context, authID string, now time.Time, operator, note string) (*model.EntryExitRecord, error) {
+func (m *Memory) ExitVehicle(ctx context.Context, authID string, now time.Time, operator, note string) (*model.EntryExitRecord, *model.Fee, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.auths[authID]
 	if !ok || a.ArchivedAt != nil {
-		return nil, ErrNotFound
+		return nil, nil, ErrNotFound
 	}
 	if a.Status == model.AuthStatusCompleted {
-		return nil, ErrAlreadyExited
+		return nil, nil, ErrAlreadyExited
 	}
 	if a.Status != model.AuthStatusActive {
-		return nil, ErrStatusTransition
+		return nil, nil, ErrStatusTransition
 	}
 	var rec *model.EntryExitRecord
 	for _, r := range m.records {
@@ -515,7 +538,7 @@ func (m *Memory) ExitVehicle(ctx context.Context, authID string, now time.Time, 
 		}
 	}
 	if rec == nil {
-		return nil, ErrStatusTransition
+		return nil, nil, ErrStatusTransition
 	}
 	et := now
 	rec.ExitTime = &et
@@ -527,7 +550,31 @@ func (m *Memory) ExitVehicle(ctx context.Context, authID string, now time.Time, 
 	a.Status = model.AuthStatusCompleted
 	a.UpdatedAt = now
 	m.auths[authID] = cloneAuth(a)
-	return cloneRecord(rec), nil
+	// Fee generation happens in the same critical section (transaction) as the
+	// exit and capacity release above. If no applicable billing rule exists,
+	// no fee is produced and the exit still succeeds.
+	var fee *model.Fee
+	if rule, _ := m.activeBillingRuleLocked(a.ParkingAreaID, rec.EntryTime); rule != nil {
+		charged, amount := ComputeFee(rec.EntryTime, now, rule.FreeMinutes, rule.HourlyRateCents, rule.DailyCapCents)
+		fee = &model.Fee{
+			ID:              NewID("fee"),
+			RecordID:        rec.ID,
+			AuthorizationID: authID,
+			Plate:           rec.Plate,
+			ParkingAreaID:   rec.ParkingAreaID,
+			BillingRuleID:   rule.ID,
+			EntryTime:       rec.EntryTime,
+			ExitTime:        now,
+			DurationMinutes: MinutesCeil(rec.EntryTime, now),
+			ChargedMinutes:  charged,
+			AmountCents:     amount,
+			Status:          model.FeeStatusUnsettled,
+			CreatedAt:       now,
+			UpdatedAt:       now,
+		}
+		m.fees[fee.ID] = cloneFee(fee)
+	}
+	return cloneRecord(rec), cloneFee(fee), nil
 }
 func (m *Memory) RevokeAuthorization(ctx context.Context, authID string, now time.Time, operator, reason string) (*model.Authorization, error) {
 	m.mu.Lock()
@@ -546,4 +593,209 @@ func (m *Memory) RevokeAuthorization(ctx context.Context, authID string, now tim
 	a.UpdatedAt = now
 	m.auths[authID] = cloneAuth(a)
 	return cloneAuth(a), nil
+}
+func (m *Memory) CreateBillingRule(ctx context.Context, r *model.BillingRule) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	area, ok := m.areas[r.ParkingAreaID]
+	if !ok || area.ArchivedAt != nil {
+		return ErrAreaArchived
+	}
+	for _, ex := range m.rules {
+		if ex.ArchivedAt != nil || ex.ParkingAreaID != r.ParkingAreaID {
+			continue
+		}
+		if ex.EffectiveFrom.Equal(r.EffectiveFrom) {
+			return ErrConflict
+		}
+	}
+	m.rules[r.ID] = cloneRule(r)
+	return nil
+}
+func (m *Memory) GetBillingRule(ctx context.Context, id string) (*model.BillingRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.rules[id]
+	if !ok || r.ArchivedAt != nil {
+		return nil, ErrNotFound
+	}
+	return cloneRule(r), nil
+}
+func (m *Memory) UpdateBillingRule(ctx context.Context, r *model.BillingRule) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.rules[r.ID]
+	if !ok || cur.ArchivedAt != nil {
+		return ErrNotFound
+	}
+	if !cur.UpdatedAt.Equal(r.UpdatedAt) {
+		return ErrConcurrentModify
+	}
+	if cur.EffectiveFrom.Equal(r.EffectiveFrom) {
+		// unchanged effective_from; no duplicate check needed
+	} else {
+		for _, ex := range m.rules {
+			if ex.ID == r.ID || ex.ArchivedAt != nil || ex.ParkingAreaID != r.ParkingAreaID {
+				continue
+			}
+			if ex.EffectiveFrom.Equal(r.EffectiveFrom) {
+				return ErrConflict
+			}
+		}
+	}
+	m.rules[r.ID] = cloneRule(r)
+	return nil
+}
+func (m *Memory) ArchiveBillingRule(ctx context.Context, id string, now time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.rules[id]
+	if !ok || r.ArchivedAt != nil {
+		return ErrNotFound
+	}
+	c := now
+	r.ArchivedAt = &c
+	r.Status = model.BillingRuleArchived
+	r.UpdatedAt = now
+	m.rules[id] = cloneRule(r)
+	return nil
+}
+func (m *Memory) ListBillingRules(ctx context.Context, f BillingRuleFilter) ([]*model.BillingRule, int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*model.BillingRule, 0, len(m.rules))
+	for _, r := range m.rules {
+		if r.ArchivedAt != nil {
+			continue
+		}
+		if f.ParkingAreaID != "" && r.ParkingAreaID != f.ParkingAreaID {
+			continue
+		}
+		if f.Status != "" && r.Status != f.Status {
+			continue
+		}
+		out = append(out, cloneRule(r))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].EffectiveFrom.After(out[j].EffectiveFrom) })
+	return pageOf(out, f.Page), int64(len(out)), nil
+}
+
+// activeBillingRuleLocked returns the effective rule for the area at time at,
+// or (nil, nil) when none applies. Caller must hold m.mu.
+func (m *Memory) activeBillingRuleLocked(areaID string, at time.Time) (*model.BillingRule, error) {
+	var best *model.BillingRule
+	for _, r := range m.rules {
+		if r.ArchivedAt != nil || r.ParkingAreaID != areaID {
+			continue
+		}
+		if r.EffectiveFrom.After(at) {
+			continue
+		}
+		if best == nil || r.EffectiveFrom.After(best.EffectiveFrom) {
+			best = r
+		}
+	}
+	return cloneRule(best), nil
+}
+func (m *Memory) ActiveBillingRule(ctx context.Context, areaID string, at time.Time) (*model.BillingRule, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.activeBillingRuleLocked(areaID, at)
+}
+func (m *Memory) CreateFee(ctx context.Context, f *model.Fee) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.fees[f.ID]; ok {
+		return ErrConflict
+	}
+	m.fees[f.ID] = cloneFee(f)
+	return nil
+}
+func (m *Memory) GetFee(ctx context.Context, id string) (*model.Fee, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	f, ok := m.fees[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return cloneFee(f), nil
+}
+func (m *Memory) ListFees(ctx context.Context, f FeeFilter) ([]*model.Fee, int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*model.Fee, 0, len(m.fees))
+	for _, fee := range m.fees {
+		if f.AreaID != "" && fee.ParkingAreaID != f.AreaID {
+			continue
+		}
+		if f.Plate != "" && fee.Plate != f.Plate {
+			continue
+		}
+		if f.RecordID != "" && fee.RecordID != f.RecordID {
+			continue
+		}
+		if f.Status != "" && fee.Status != f.Status {
+			continue
+		}
+		out = append(out, cloneFee(fee))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ExitTime.After(out[j].ExitTime) })
+	return pageOf(out, f.Page), int64(len(out)), nil
+}
+func (m *Memory) SettleFee(ctx context.Context, id, method, reason, operator string, now time.Time) (*model.Fee, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	f, ok := m.fees[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if f.Status == model.FeeStatusSettled {
+		return nil, ErrAlreadySettled
+	}
+	f.Status = model.FeeStatusSettled
+	f.SettleMethod = method
+	f.SettleReason = reason
+	f.SettleOperator = operator
+	st := now
+	f.SettledAt = &st
+	f.UpdatedAt = now
+	m.fees[id] = cloneFee(f)
+	return cloneFee(f), nil
+}
+func (m *Memory) AreaRevenue(ctx context.Context, f AreaRevenueFilter) ([]*model.AreaRevenue, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*model.AreaRevenue, 0, len(m.areas))
+	for _, a := range m.areas {
+		if a.ArchivedAt != nil {
+			continue
+		}
+		if f.AreaID != "" && a.ID != f.AreaID {
+			continue
+		}
+		rev := &model.AreaRevenue{AreaID: a.ID, AreaName: a.Name, Code: a.Code}
+		for _, fee := range m.fees {
+			if fee.ParkingAreaID != a.ID {
+				continue
+			}
+			if f.From != nil && fee.ExitTime.Before(*f.From) {
+				continue
+			}
+			if f.To != nil && !fee.ExitTime.Before(*f.To) {
+				continue
+			}
+			rev.FeeCount++
+			if fee.Status == model.FeeStatusSettled {
+				rev.SettledCount++
+				rev.SettledCents += fee.AmountCents
+			} else {
+				rev.UnsettledCount++
+				rev.UnsettledCents += fee.AmountCents
+			}
+		}
+		rev.TotalCents = rev.SettledCents + rev.UnsettledCents
+		out = append(out, rev)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].AreaName < out[j].AreaName })
+	return out, nil
 }

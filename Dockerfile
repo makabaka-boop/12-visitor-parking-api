@@ -12,7 +12,7 @@ RUN apk add --no-cache ca-certificates tzdata && \
     adduser -D -u 10001 app
 WORKDIR /app
 COPY --from=builder /out/server /app/server
-COPY internal/migrations/001_init.sql /app/migrations/001_init.sql
+COPY internal/migrations /app/migrations
 USER app
 EXPOSE 8117
 ENV HTTP_ADDR=:8117 \

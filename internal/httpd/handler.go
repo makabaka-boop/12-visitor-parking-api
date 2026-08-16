@@ -1,4 +1,5 @@
 package httpd
+
 import (
 	"net/http"
 	"strings"
@@ -6,9 +7,11 @@ import (
 	"visitor-parking/internal/model"
 	"visitor-parking/internal/service"
 )
+
 type Handler struct {
 	svc *service.Service
 }
+
 func NewHandler(svc *service.Service) *Handler {
 	return &Handler{svc: svc}
 }
@@ -43,7 +46,16 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/stats/today-arrivals", h.todayArrivals)
 	mux.HandleFunc("GET /api/v1/stats/expiring-soon", h.expiringSoon)
 	mux.HandleFunc("GET /api/v1/stats/occupancy", h.occupancy)
+	mux.HandleFunc("GET /api/v1/stats/area-revenue", h.areaRevenue)
 	mux.HandleFunc("GET /api/v1/audit-logs", h.listAuditLogs)
+	mux.HandleFunc("POST /api/v1/billing-rules", h.createBillingRule)
+	mux.HandleFunc("GET /api/v1/billing-rules", h.listBillingRules)
+	mux.HandleFunc("GET /api/v1/billing-rules/{id}", h.getBillingRule)
+	mux.HandleFunc("PUT /api/v1/billing-rules/{id}", h.updateBillingRule)
+	mux.HandleFunc("DELETE /api/v1/billing-rules/{id}", h.archiveBillingRule)
+	mux.HandleFunc("GET /api/v1/fees", h.listFees)
+	mux.HandleFunc("GET /api/v1/fees/{id}", h.getFee)
+	mux.HandleFunc("POST /api/v1/fees/{id}/settle", h.settleFee)
 	return mux
 }
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
@@ -291,7 +303,7 @@ func (h *Handler) exit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	rec, err := h.svc.ExitVehicle(r.Context(), r.PathValue("id"), in)
+	rec, _, err := h.svc.ExitVehicle(r.Context(), r.PathValue("id"), in)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -352,6 +364,103 @@ func (h *Handler) listAuditLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	writeOK(w, http.StatusOK, paginate(items, int64(len(items)), limit, offset))
 }
+func (h *Handler) createBillingRule(w http.ResponseWriter, r *http.Request) {
+	var in service.CreateBillingRuleInput
+	if err := decodeJSON(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	in.EffectiveFrom = parseTimeFlexible(in.EffectiveFrom)
+	rule, err := h.svc.CreateBillingRule(r.Context(), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, http.StatusCreated, rule)
+}
+func (h *Handler) listBillingRules(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit, offset := parsePage(r)
+	items, total, err := h.svc.ListBillingRules(r.Context(), q.Get("area_id"), q.Get("status"), limit, offset)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, http.StatusOK, paginate(items, total, limit, offset))
+}
+func (h *Handler) getBillingRule(w http.ResponseWriter, r *http.Request) {
+	rule, err := h.svc.GetBillingRule(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, http.StatusOK, rule)
+}
+func (h *Handler) updateBillingRule(w http.ResponseWriter, r *http.Request) {
+	var in service.UpdateBillingRuleInput
+	if err := decodeJSON(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	in.EffectiveFrom = parseTimeFlexible(in.EffectiveFrom)
+	rule, err := h.svc.UpdateBillingRule(r.Context(), r.PathValue("id"), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, http.StatusOK, rule)
+}
+func (h *Handler) archiveBillingRule(w http.ResponseWriter, r *http.Request) {
+	if err := h.svc.ArchiveBillingRule(r.Context(), r.PathValue("id")); err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, http.StatusNoContent, nil)
+}
+func (h *Handler) listFees(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit, offset := parsePage(r)
+	f := service.ListFeeFilter{
+		AreaID: q.Get("area_id"), Plate: q.Get("plate"), RecordID: q.Get("record_id"),
+		Status: q.Get("status"), Limit: limit, Offset: offset,
+	}
+	items, total, err := h.svc.ListFees(r.Context(), f)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, http.StatusOK, paginate(items, total, limit, offset))
+}
+func (h *Handler) getFee(w http.ResponseWriter, r *http.Request) {
+	fee, err := h.svc.GetFee(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, http.StatusOK, fee)
+}
+func (h *Handler) settleFee(w http.ResponseWriter, r *http.Request) {
+	var in service.SettleFeeInput
+	if err := decodeJSON(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	fee, err := h.svc.SettleFee(r.Context(), r.PathValue("id"), in)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, http.StatusOK, fee)
+}
+func (h *Handler) areaRevenue(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	items, err := h.svc.AreaRevenue(r.Context(), q.Get("area_id"), q.Get("from"), q.Get("to"))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeOK(w, http.StatusOK, map[string]interface{}{"areas": items})
+}
 func parseTimeFlexible(t time.Time) time.Time {
 	return t
 }
@@ -361,12 +470,14 @@ func pageNo(limit, offset int) int {
 	}
 	return offset/limit + 1
 }
+
 type pageResult struct {
 	Items interface{} `json:"items"`
 	Total int64       `json:"total"`
 	Page  int         `json:"page"`
 	Size  int         `json:"size"`
 }
+
 func paginate(items interface{}, total int64, limit, offset int) pageResult {
 	return pageResult{Items: items, Total: total, Page: pageNo(limit, offset), Size: limit}
 }

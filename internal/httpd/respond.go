@@ -1,4 +1,5 @@
 package httpd
+
 import (
 	"encoding/json"
 	"errors"
@@ -7,6 +8,7 @@ import (
 	"visitor-parking/internal/service"
 	"visitor-parking/internal/store"
 )
+
 type envelope struct {
 	Code    int         `json:"code"` // HTTP status
 	Success bool        `json:"success"`
@@ -17,6 +19,7 @@ type errBody struct {
 	Message string               `json:"message"`
 	Fields  []service.FieldError `json:"fields,omitempty"`
 }
+
 func writeOK(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -63,6 +66,9 @@ func writeErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrAreaArchived):
 		status = http.StatusBadRequest
 		body.Message = "parking area is archived"
+	case errors.Is(err, store.ErrAlreadySettled):
+		status = http.StatusConflict
+		body.Message = "fee is already settled"
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)

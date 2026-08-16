@@ -1,4 +1,5 @@
 package service
+
 import (
 	"context"
 	"errors"
@@ -9,12 +10,15 @@ import (
 	"visitor-parking/internal/plate"
 	"visitor-parking/internal/store"
 )
+
 const MaxAuthDuration = 7 * 24 * time.Hour
 const ExpiringSoonWindow = 6 * time.Hour
+
 type Service struct {
 	store store.Store
 	now   func() time.Time // injectable clock for deterministic tests
 }
+
 func New(s store.Store) *Service {
 	return &Service{store: s, now: time.Now}
 }
@@ -31,6 +35,7 @@ func normPage(limit, offset int) model.Page {
 	}
 	return model.Page{Limit: limit, Offset: offset}
 }
+
 type CreateResidentInput struct {
 	Name     string `json:"name"`
 	Phone    string `json:"phone"`
@@ -39,6 +44,7 @@ type CreateResidentInput struct {
 	Room     string `json:"room"`
 	Status   string `json:"status"`
 }
+
 func (s *Service) CreateResident(ctx context.Context, in CreateResidentInput) (*model.Resident, error) {
 	if err := validateResidentFields(in.Name, in.Phone, in.Building); err != nil {
 		return nil, err
@@ -76,15 +82,17 @@ func validateResidentFields(name, phone, building string) error {
 func (s *Service) GetResident(ctx context.Context, id string) (*model.Resident, error) {
 	return s.store.GetResident(ctx, id)
 }
+
 type UpdateResidentInput struct {
-	Name     string `json:"name"`
-	Phone    string `json:"phone"`
-	Building string `json:"building"`
-	Unit     string `json:"unit"`
-	Room     string `json:"room"`
-	Status   string `json:"status"`
+	Name      string    `json:"name"`
+	Phone     string    `json:"phone"`
+	Building  string    `json:"building"`
+	Unit      string    `json:"unit"`
+	Room      string    `json:"room"`
+	Status    string    `json:"status"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
+
 func (s *Service) UpdateResident(ctx context.Context, id string, in UpdateResidentInput) (*model.Resident, error) {
 	if err := validateResidentFields(in.Name, in.Phone, in.Building); err != nil {
 		return nil, err
@@ -128,12 +136,14 @@ func (s *Service) ArchiveResident(ctx context.Context, id string) error {
 func (s *Service) ListResidents(ctx context.Context, limit, offset int) ([]*model.Resident, int64, error) {
 	return s.store.ListResidents(ctx, normPage(limit, offset))
 }
+
 type CreateVehicleInput struct {
 	Plate      string `json:"plate"`
 	OwnerName  string `json:"owner_name"`
 	OwnerPhone string `json:"owner_phone"`
 	Color      string `json:"color"`
 }
+
 func (s *Service) CreateVehicle(ctx context.Context, in CreateVehicleInput) (*model.Vehicle, error) {
 	p := plate.Normalize(in.Plate)
 	if !plate.Valid(p) {
@@ -205,11 +215,13 @@ func (s *Service) ArchiveVehicle(ctx context.Context, id string) error {
 func (s *Service) ListVehicles(ctx context.Context, limit, offset int) ([]*model.Vehicle, int64, error) {
 	return s.store.ListVehicles(ctx, normPage(limit, offset))
 }
+
 type CreateParkingAreaInput struct {
 	Name     string `json:"name"`
 	Code     string `json:"code"`
 	Capacity int    `json:"capacity"`
 }
+
 func (s *Service) CreateParkingArea(ctx context.Context, in CreateParkingAreaInput) (*model.ParkingArea, error) {
 	if strings.TrimSpace(in.Name) == "" {
 		return nil, newFieldError("name", "must not be empty")
@@ -275,6 +287,7 @@ func (s *Service) ArchiveParkingArea(ctx context.Context, id string) error {
 func (s *Service) ListParkingAreas(ctx context.Context, limit, offset int) ([]*model.ParkingArea, int64, error) {
 	return s.store.ListParkingAreas(ctx, normPage(limit, offset))
 }
+
 type CreateAuthorizationInput struct {
 	ResidentID    string    `json:"resident_id"`
 	Plate         string    `json:"plate"`
@@ -284,6 +297,7 @@ type CreateAuthorizationInput struct {
 	Purpose       string    `json:"purpose"`
 	CreatedBy     string    `json:"created_by"`
 }
+
 func (s *Service) CreateAuthorization(ctx context.Context, in CreateAuthorizationInput) (*model.Authorization, error) {
 	now := s.nowT()
 	p := plate.Normalize(in.Plate)
@@ -402,6 +416,7 @@ func (s *Service) ListAuthorizations(ctx context.Context, f ListAuthFilter) ([]*
 	}
 	return s.store.ListAuthorizations(ctx, storeFilter)
 }
+
 type ListAuthFilter struct {
 	Building      string
 	Plate         string
@@ -412,6 +427,7 @@ type ListAuthFilter struct {
 	ExpiringSoon  bool
 	Limit, Offset int
 }
+
 func (s *Service) EnterVehicle(ctx context.Context, authID string) (*model.EntryExitRecord, error) {
 	now := s.nowT()
 	rec, err := s.store.EnterVehicle(ctx, authID, now)
@@ -421,18 +437,24 @@ func (s *Service) EnterVehicle(ctx context.Context, authID string) (*model.Entry
 	s.audit(ctx, "entry.record", "record", rec.ID, "gate", fmt.Sprintf("vehicle %s entered area %s", rec.Plate, rec.ParkingAreaID))
 	return rec, nil
 }
+
 type ExitRequest struct {
 	Operator string `json:"operator"`
 	Note     string `json:"note"`
 }
-func (s *Service) ExitVehicle(ctx context.Context, authID string, in ExitRequest) (*model.EntryExitRecord, error) {
+
+func (s *Service) ExitVehicle(ctx context.Context, authID string, in ExitRequest) (*model.EntryExitRecord, *model.Fee, error) {
 	now := s.nowT()
-	rec, err := s.store.ExitVehicle(ctx, authID, now, strings.TrimSpace(in.Operator), in.Note)
+	rec, fee, err := s.store.ExitVehicle(ctx, authID, now, strings.TrimSpace(in.Operator), in.Note)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	s.audit(ctx, "exit.record", "record", rec.ID, defStr(in.Operator, "system"), fmt.Sprintf("vehicle %s exited", rec.Plate))
-	return rec, nil
+	if fee != nil {
+		s.audit(ctx, "fee.create", "fee", fee.ID, defStr(in.Operator, "system"),
+			fmt.Sprintf("fee %s cents=%d charged=%dm", fee.ID, fee.AmountCents, fee.ChargedMinutes))
+	}
+	return rec, fee, nil
 }
 func (s *Service) Revoke(ctx context.Context, authID string, operator, reason string) (*model.Authorization, error) {
 	a, err := s.store.RevokeAuthorization(ctx, authID, s.nowT(), operator, reason)
@@ -481,11 +503,13 @@ func defStr(in, def string) string {
 	}
 	return in
 }
+
 type FieldError struct {
 	Field   string `json:"field"`
 	Message string `json:"message"`
 }
-func (e *FieldError) Error() string { return e.Field + ": " + e.Message }
+
+func (e *FieldError) Error() string               { return e.Field + ": " + e.Message }
 func newFieldError(field, msg string) *FieldError { return &FieldError{Field: field, Message: msg} }
 func NewFieldError(field, msg string) *FieldError { return &FieldError{Field: field, Message: msg} }
 func IsFieldError(err error) bool {
@@ -499,3 +523,196 @@ func FieldErrorOf(err error) *FieldError {
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// 临时停车计费 (temporary parking billing)
+// ---------------------------------------------------------------------------
+
+const (
+	// cents per yuan, used for documenting the integer-cents money convention.
+	centsPerYuan = 100
+)
+
+type CreateBillingRuleInput struct {
+	ParkingAreaID   string    `json:"parking_area_id"`
+	FreeMinutes     int       `json:"free_minutes"`
+	HourlyRateCents int64     `json:"hourly_rate_cents"`
+	DailyCapCents   int64     `json:"daily_cap_cents"`
+	EffectiveFrom   time.Time `json:"effective_from"`
+}
+
+func validateBillingRuleFields(freeMinutes int, hourlyRateCents, dailyCapCents int64) error {
+	if freeMinutes < 0 {
+		return newFieldError("free_minutes", "must not be negative")
+	}
+	if hourlyRateCents <= 0 {
+		return newFieldError("hourly_rate_cents", "must be greater than zero")
+	}
+	if dailyCapCents < 0 {
+		return newFieldError("daily_cap_cents", "must not be negative (0 means no daily cap)")
+	}
+	return nil
+}
+
+func (s *Service) CreateBillingRule(ctx context.Context, in CreateBillingRuleInput) (*model.BillingRule, error) {
+	if strings.TrimSpace(in.ParkingAreaID) == "" {
+		return nil, newFieldError("parking_area_id", "must not be empty")
+	}
+	if err := validateBillingRuleFields(in.FreeMinutes, in.HourlyRateCents, in.DailyCapCents); err != nil {
+		return nil, err
+	}
+	now := s.nowT()
+	eff := in.EffectiveFrom
+	if eff.IsZero() {
+		eff = now
+	}
+	r := &model.BillingRule{
+		ID:              store.NewID("rule"),
+		ParkingAreaID:   in.ParkingAreaID,
+		FreeMinutes:     in.FreeMinutes,
+		HourlyRateCents: in.HourlyRateCents,
+		DailyCapCents:   in.DailyCapCents,
+		EffectiveFrom:   eff,
+		Status:          model.BillingRuleActive,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	if err := s.store.CreateBillingRule(ctx, r); err != nil {
+		return nil, err
+	}
+	s.audit(ctx, "billing_rule.create", "billing_rule", r.ID, "system", "billing rule created")
+	return r, nil
+}
+
+func (s *Service) GetBillingRule(ctx context.Context, id string) (*model.BillingRule, error) {
+	return s.store.GetBillingRule(ctx, id)
+}
+
+type UpdateBillingRuleInput struct {
+	FreeMinutes     *int      `json:"free_minutes"`
+	HourlyRateCents *int64    `json:"hourly_rate_cents"`
+	DailyCapCents   *int64    `json:"daily_cap_cents"`
+	EffectiveFrom   time.Time `json:"effective_from"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+func (s *Service) UpdateBillingRule(ctx context.Context, id string, in UpdateBillingRuleInput) (*model.BillingRule, error) {
+	if in.UpdatedAt.IsZero() {
+		return nil, newFieldError("updated_at", "is required for concurrency check")
+	}
+	cur, err := s.store.GetBillingRule(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if !in.UpdatedAt.Equal(cur.UpdatedAt) {
+		return nil, store.ErrConcurrentModify
+	}
+	if in.FreeMinutes != nil {
+		cur.FreeMinutes = *in.FreeMinutes
+	}
+	if in.HourlyRateCents != nil {
+		cur.HourlyRateCents = *in.HourlyRateCents
+	}
+	if in.DailyCapCents != nil {
+		cur.DailyCapCents = *in.DailyCapCents
+	}
+	if !in.EffectiveFrom.IsZero() {
+		cur.EffectiveFrom = in.EffectiveFrom
+	}
+	if err := validateBillingRuleFields(cur.FreeMinutes, cur.HourlyRateCents, cur.DailyCapCents); err != nil {
+		return nil, err
+	}
+	cur.UpdatedAt = s.nowT()
+	if err := s.store.UpdateBillingRule(ctx, cur); err != nil {
+		return nil, err
+	}
+	s.audit(ctx, "billing_rule.update", "billing_rule", id, "system", "billing rule updated")
+	return cur, nil
+}
+
+func (s *Service) ArchiveBillingRule(ctx context.Context, id string) error {
+	if err := s.store.ArchiveBillingRule(ctx, id, s.nowT()); err != nil {
+		return err
+	}
+	s.audit(ctx, "billing_rule.archive", "billing_rule", id, "system", "billing rule archived")
+	return nil
+}
+
+func (s *Service) ListBillingRules(ctx context.Context, areaID, status string, limit, offset int) ([]*model.BillingRule, int64, error) {
+	return s.store.ListBillingRules(ctx, store.BillingRuleFilter{
+		ParkingAreaID: areaID, Status: status, Page: normPage(limit, offset),
+	})
+}
+
+func (s *Service) GetFee(ctx context.Context, id string) (*model.Fee, error) {
+	return s.store.GetFee(ctx, id)
+}
+
+type ListFeeFilter struct {
+	AreaID   string
+	Plate    string
+	RecordID string
+	Status   string
+	Limit    int
+	Offset   int
+}
+
+func (s *Service) ListFees(ctx context.Context, f ListFeeFilter) ([]*model.Fee, int64, error) {
+	return s.store.ListFees(ctx, store.FeeFilter{
+		AreaID: f.AreaID, Plate: plate.Normalize(f.Plate), RecordID: f.RecordID, Status: f.Status,
+		Page: normPage(f.Limit, f.Offset),
+	})
+}
+
+type SettleFeeInput struct {
+	Method   string `json:"method"` // cash | online | waiver
+	Reason   string `json:"reason"` // required when method == waiver
+	Operator string `json:"operator"`
+}
+
+func validSettleMethod(m string) bool {
+	switch m {
+	case model.SettleCash, model.SettleOnline, model.SettleWaiver:
+		return true
+	}
+	return false
+}
+
+func (s *Service) SettleFee(ctx context.Context, id string, in SettleFeeInput) (*model.Fee, error) {
+	method := strings.TrimSpace(in.Method)
+	if !validSettleMethod(method) {
+		return nil, newFieldError("method", "must be one of cash, online, waiver")
+	}
+	reason := strings.TrimSpace(in.Reason)
+	if method == model.SettleWaiver && reason == "" {
+		return nil, newFieldError("reason", "waiver requires a reason")
+	}
+	fee, err := s.store.SettleFee(ctx, id, method, reason, defStr(in.Operator, "system"), s.nowT())
+	if err != nil {
+		return nil, err
+	}
+	s.audit(ctx, "fee.settle", "fee", id, defStr(in.Operator, "system"),
+		fmt.Sprintf("fee settled via %s, cents=%d", method, fee.AmountCents))
+	return fee, nil
+}
+
+func (s *Service) AreaRevenue(ctx context.Context, areaID, from, to string) ([]*model.AreaRevenue, error) {
+	f := store.AreaRevenueFilter{AreaID: strings.TrimSpace(areaID)}
+	if from != "" {
+		t, err := time.Parse(time.RFC3339, from)
+		if err != nil {
+			return nil, newFieldError("from", "must be a valid RFC3339 timestamp")
+		}
+		f.From = &t
+	}
+	if to != "" {
+		t, err := time.Parse(time.RFC3339, to)
+		if err != nil {
+			return nil, newFieldError("to", "must be a valid RFC3339 timestamp")
+		}
+		f.To = &t
+	}
+	return s.store.AreaRevenue(ctx, f)
+}
+
+var _ = centsPerYuan

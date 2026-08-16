@@ -17,10 +17,10 @@
 │   ├── config/                 # 环境变量配置
 │   ├── model/                  # 领域模型与状态常量
 │   ├── plate/                  # 车牌格式校验
-│   ├── store/                  # Store 接口 + 内存实现 + PostgreSQL 实现
-│   ├── service/                # 业务逻辑、校验、状态迁移、审计
+│   ├── store/                  # Store 接口 + 内存实现 + PostgreSQL 实现 + 计费纯函数
+│   ├── service/                # 业务逻辑、校验、状态迁移、审计、计费结算
 │   ├── httpd/                  # HTTP 路由、统一响应、结构化日志、健康检查
-│   └── migrations/             # 内嵌 SQL 迁移脚本
+│   └── migrations/             # 内嵌 SQL 迁移脚本 (001_init + 002_billing)
 ├── Dockerfile                  # 生产多阶段镜像（官方多架构，容器内按平台编译）
 ├── benzhi.Dockerfile           # 评测镜像（保留完整 Go 工具链）
 ├── build_benzhi_docker.sh      # 评测构建脚本
@@ -31,10 +31,11 @@
 ## 设计要点
 
 - **可替换存储**：业务逻辑仅依赖 `store.Store` 接口。生产用 PostgreSQL；测试用 `store.NewMemory()` 内存实现，**测试不依赖任何外部数据库**。
-- **事务**：入场/离场/撤销/创建授权在事务内完成（PostgreSQL 用 `SERIALIZABLE` 事务 + `FOR UPDATE`；内存实现用全局互斥锁），避免容量与重叠校验的 TOCTOU。
+- **事务**：入场/离场/撤销/创建授权在事务内完成（PostgreSQL 用 `SERIALIZABLE` 事务 + `FOR UPDATE`；内存实现用全局互斥锁），避免容量与重叠校验的 TOCTOU。**离场、费用单生成与名额释放在同一事务完成**（见迭代二）。
 - **软删除**：除进出记录永久保留外，其余实体通过 `archived_at` 软归档。
-- **审计**：关键变更写 `audit_logs`。
-- **并发检查**：更新接口要求客户端回传 `updated_at`，服务端校验版本一致后再更新。
+- **审计**：关键变更写 `audit_logs`（含计费规则与费用单的创建/结算）。
+- **并发检查**：更新接口要求客户端回传 `updated_at`，服务端校验版本一致后再更新。费用单结算采用条件更新保证幂等与并发安全。
+- **金额**：所有金额以整数「分」存储与计算，不使用浮点数。计费纯函数 `store.ComputeFee` 为内存与 PostgreSQL 共用同一实现。
 
 ## 状态机
 
@@ -125,6 +126,8 @@ go vet ./...                   # 静态检查
      -d '{"operator":"guard1","note":"正常离场"}'
    # → data.status=exited, 授权变 completed, 释放名额
    # 已离场再次核销 → 409
+   # 若区域存在生效计费规则，则在同一事务内生成 unsettled 费用单
+   # （通过 GET /api/v1/fees?record_id=<记录ID> 查询）
    ```
 6. **物业撤销未使用授权**（仅 pending 可撤销）
    ```bash
@@ -157,6 +160,12 @@ go vet ./...                   # 静态检查
 | GET | `/api/v1/stats/today-arrivals` | 今日预计到访 |
 | GET | `/api/v1/stats/expiring-soon` | 即将过期授权（6h 内） |
 | GET | `/api/v1/stats/occupancy` | 各区域占用率 |
+| GET | `/api/v1/stats/area-revenue` | 各区域收入汇总（area_id/from/to 筛选） |
+| POST/GET | `/api/v1/billing-rules` | 创建 / 列表（area_id,status 筛选） |
+| GET/PUT/DELETE | `/api/v1/billing-rules/{id}` | 详情 / 更新(需 updated_at) / 归档 |
+| GET | `/api/v1/fees` | 费用单列表（status,area_id,plate,record_id 筛选） |
+| GET | `/api/v1/fees/{id}` | 费用单详情 |
+| POST | `/api/v1/fees/{id}/settle` | 结算（cash/online/waiver，waiver 必填 reason） |
 | GET | `/api/v1/audit-logs` | 审计日志（entity_type 筛选） |
 
 ### 授权列表筛选（query string）
@@ -176,6 +185,94 @@ curl -s 'localhost:8117/api/v1/stats/occupancy'
 - `end_time` 晚于 `start_time`
 - 单次时长 ≤ 7 天
 - 同一车牌在重叠时间内只能存在一条有效授权（pending/active），冲突 → 409
+
+## 迭代二：临时停车计费
+
+在车辆入场/离场记录之上新增临时停车计费模块。
+
+### 金额约定
+
+**所有金额以「分」为单位的整数存储与传输（1 元 = 100 分），全程不使用浮点数**，避免 `0.1+0.2` 类浮点误差。涉及字段：`hourly_rate_cents`（小时单价）、`daily_cap_cents`（每日封顶，`0` 表示不封顶）、`amount_cents`（应收金额）、`settled_cents` / `unsettled_cents` / `total_cents`（收入汇总）。
+
+### 计费规则模型
+
+为停车区域配置：`free_minutes`（免费分钟数）、`hourly_rate_cents`（小时单价）、`daily_cap_cents`（每日封顶）、`effective_from`（启用时间）。同一区域可有多条规则按 `effective_from` 版本化；离场计费时取「`effective_from <= 入场时间` 且最新」的规则。归档后不可再用于新计费，但已生成费用单不受影响（费用单自包含金额）。
+
+### 计费算法（`store.ComputeFee`，纯函数，内存与 PostgreSQL 共用）
+
+1. `free_minutes` 是整段停留的一次性免费额度，从入场时刻起扣减；若整段停留 ≤ 免费时长，则费用为 0。
+2. 超出免费时段后的计费时长**向上取整到整小时**（不足一小时按一小时计算）。
+3. 停留按**自然日**（入场时区午夜为界）切分，每个自然日独立计算 `ceil(计费分钟/60) × 小时单价`，并**各自应用每日封顶**（跨自然日分别封顶）。
+4. 各自然日金额求和为总应收金额。
+
+### 费用单与结算
+
+- 车辆离场时，若区域存在生效规则，则**在离场的同一事务内**生成费用单（状态 `unsettled`）；离场、费用生成、区域名额释放在同一事务完成。
+- 结算方式：`cash`（现金）、`online`（线上）、`waiver`（减免）。**减免必须填写原因**，否则 400。
+- 已结算费用单不得重复结算，重复请求返回 **409**。结算采用条件更新（`WHERE status='unsettled'`），并发安全。
+
+### 典型流程：计费规则 → 离场计费 → 结算
+
+```bash
+# 1. 为区域配置计费规则（免费30分钟，5元/小时=500分/小时，每日封顶40元=4000分）
+curl -s -X POST localhost:8117/api/v1/billing-rules \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "parking_area_id":"area_...",
+    "free_minutes":30,
+    "hourly_rate_cents":500,
+    "daily_cap_cents":4000
+  }'
+# → data.id = rule_..., status=active
+# effective_from 省略时默认为当前时间
+
+# 2. 车辆入场（同迭代一）
+curl -s -X POST localhost:8117/api/v1/authorizations/auth_.../entry
+
+# 3. 车辆离场 —— 同一事务内生成费用单
+curl -s -X POST localhost:8117/api/v1/authorizations/auth_.../exit \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"guard1","note":"正常离场"}'
+# data.status=exited（响应体为进出记录；费用单需另行查询）
+
+# 4. 查询该记录的费用单
+curl -s 'localhost:8117/api/v1/fees?record_id=rec_...'
+# → data.items[0] = {id, amount_cents, status:"unsettled", ...}
+
+# 5. 结算费用单 —— 现金
+curl -s -X POST localhost:8117/api/v1/fees/fee_.../settle \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"cash","operator":"cashier"}'
+# → data.status=settled
+
+# 5b. 减免结算（必须带原因）
+curl -s -X POST localhost:8117/api/v1/fees/fee_.../settle \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"waiver","reason":"物业赠送","operator":"mgr"}'
+
+# 6. 查询未结算费用
+curl -s 'localhost:8117/api/v1/fees?status=unsettled&area_id=area_...'
+
+# 7. 区域收入汇总（可加 from/to RFC3339 时间范围按离场时间过滤）
+curl -s 'localhost:8117/api/v1/stats/area-revenue?area_id=area_...'
+# → data.areas[] = {fee_count, settled_count, unsettled_count,
+#                   settled_cents, unsettled_cents, total_cents}
+```
+
+### 计费规则管理
+
+```bash
+# 列表（按 area_id 筛选）
+curl -s 'localhost:8117/api/v1/billing-rules?area_id=area_...'
+# 详情
+curl -s localhost:8117/api/v1/billing-rules/rule_...
+# 修改（需 updated_at 乐观锁）
+curl -s -X PUT localhost:8117/api/v1/billing-rules/rule_... \
+  -H 'Content-Type: application/json' \
+  -d '{"hourly_rate_cents":600,"updated_at":"<查询返回的 updated_at>"}'
+# 归档
+curl -s -X DELETE localhost:8117/api/v1/billing-rules/rule_...
+```
 
 ## Docker
 
@@ -217,3 +314,5 @@ go test -race ./...     # 竞态检测
 ```
 
 覆盖：创建授权全部校验规则、重叠冲突、入场/离场状态迁移、容量限制、重复入场/离场冲突、撤销前置状态、更新并发冲突、统计接口、软删除、统一错误响应与校验明细。
+
+迭代二计费测试覆盖：`ComputeFee` 纯函数（免费时长、不足一小时向上取整、单日封顶、跨自然日分别封顶、免费额度跨日结转、0=不封顶）；离场同事务生成费用单与释放名额；免费期内 0 费用；每日封顶；跨日封顶；现金结算后重复结算 409；减免必须填原因；非法结算方式 400；未结算费用查询；区域收入汇总；计费规则 CRUD 与乐观锁；归档区域拒绝建规则；无规则区域离场不生成费用且仍释放名额；规则版本化（按入场时间取最新生效规则）；并发结算仅一笔成功（`-race`）。
