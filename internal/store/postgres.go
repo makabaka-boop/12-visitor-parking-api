@@ -589,7 +589,11 @@ func (p *Postgres) ApproveExtensionApplication(ctx context.Context, appID string
 			return fmt.Errorf("%w: total authorization duration must not exceed 7 days", ErrConflict)
 		}
 		var n int64
-		if err := p.q(ctx).QueryRowContext(ctx, `SELECT count(*) FROM authorizations WHERE plate=$1 AND archived_at IS NULL AND status IN ('pending','active') AND id<>$2 AND start_time < $3 AND end_time > $4`, plate, authID, newEnd, aStart).Scan(&n); err != nil {
+		// Exclude authorizations whose validity window has already elapsed by
+		// the approval time (end_time <= now): a historical pending
+		// authorization whose status was not transitioned to "expired" must not
+		// be counted as an overlap against the extended window.
+		if err := p.q(ctx).QueryRowContext(ctx, `SELECT count(*) FROM authorizations WHERE plate=$1 AND archived_at IS NULL AND status IN ('pending','active') AND id<>$2 AND start_time < $3 AND end_time > $4 AND end_time > $5`, plate, authID, newEnd, aStart, now).Scan(&n); err != nil {
 			return err
 		}
 		if n > 0 {

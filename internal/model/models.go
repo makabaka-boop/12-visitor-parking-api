@@ -25,15 +25,21 @@ const (
 	ExtStatusRejected = "rejected" // 已驳回
 	ExtStatusRevoked  = "revoked"  // 已撤销
 )
-// ExtensibleAuth reports whether an authorization may still be extended:
-// active authorizations always qualify (vehicle still on premises); pending
-// ones qualify only while inside their validity window (not yet expired).
-// Completed, cancelled and (derived) expired authorizations are not extensible.
+// ExtensibleAuth reports whether an authorization may still be extended.
+// Both pending and active authorizations qualify only while their validity
+// window has not yet elapsed (now is before endTime): once the end time has
+// been reached the authorization is effectively expired and may not be
+// extended, regardless of its stored status. (Active status is not derived to
+// "expired", so the time check is required here; the vehicle may still be on
+// the premises, but its authorized window has passed.) Completed, cancelled
+// and expired authorizations are not extensible.
 func ExtensibleAuth(status string, endTime time.Time, now time.Time) bool {
 	if status != AuthStatusPending && status != AuthStatusActive {
 		return false
 	}
-	if status == AuthStatusPending && !now.Before(endTime) {
+	// An authorization whose validity window has passed is expired and not
+	// extensible, whether its stored status is pending or active.
+	if !now.Before(endTime) {
 		return false
 	}
 	return true

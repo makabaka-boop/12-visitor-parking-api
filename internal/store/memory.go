@@ -617,6 +617,13 @@ func (m *Memory) ApproveExtensionApplication(ctx context.Context, appID string, 
 		if ex.Status == model.AuthStatusCompleted || ex.Status == model.AuthStatusCancelled {
 			continue
 		}
+		// Skip authorizations whose validity window has already elapsed by the
+		// approval time. Their stored status may still be "pending" (expired is
+		// a derived status), but they are no longer live and must not be counted
+		// as an overlap conflict against the extended window.
+		if !ex.EndTime.After(now) {
+			continue
+		}
 		if a.StartTime.Before(ex.EndTime) && ex.StartTime.Before(app.NewEndTime) {
 			return nil, nil, ErrConflict
 		}
