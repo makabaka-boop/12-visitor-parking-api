@@ -113,3 +113,44 @@ type AreaOccupancy struct {
 	Available   int     `json:"available"`
 	Utilization float64 `json:"utilization"` // occupied / capacity
 }
+const (
+	RestrictionTypeForbidden     = "forbidden"       // 禁止入场：直接拒绝
+	RestrictionTypeManualConfirm = "manual_confirm"  // 人工确认：请求须提交确认人
+)
+const (
+	RestrictionStatusActive   = "active"   // 生效中
+	RestrictionStatusReleased = "released" // 已解除（历史保留，不可恢复为 active）
+)
+// VehicleRestriction is a vehicle plate on the restriction list managed by
+// property staff. A plate may be forbidden from entry or require manual
+// confirmation during a given [EffectiveFrom, EffectiveTo) window.
+type VehicleRestriction struct {
+	ID            string     `json:"id"`
+	Plate         string     `json:"plate"`
+	Type          string     `json:"type"` // forbidden | manual_confirm
+	EffectiveFrom time.Time  `json:"effective_from"`
+	EffectiveTo   time.Time  `json:"effective_to"`
+	Reason        string     `json:"reason"`
+	RegisteredBy  string     `json:"registered_by"`
+	Status        string     `json:"status"` // active | released
+	ArchivedAt    *time.Time `json:"archived_at,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"` // also used as optimistic-lock version token
+}
+// RestrictionFilter is the combined filter for listing vehicle restrictions.
+type RestrictionFilter struct {
+	Plate        string
+	Type         string // forbidden | manual_confirm
+	Status       string // active | released
+	RegisteredBy string
+	EffectiveOn  *time.Time // restrictions in effect at this instant
+	Page         Page
+}
+// RestrictionStats summarises the current restriction list.
+type RestrictionStats struct {
+	TotalActive       int64 `json:"total_active"`        // status=active, not archived
+	CurrentlyInEffect int64 `json:"currently_in_effect"` // active AND now within [effective_from, effective_to)
+	Forbidden         int64 `json:"forbidden"`           // active, type=forbidden
+	ManualConfirm     int64 `json:"manual_confirm"`      // active, type=manual_confirm
+	Released          int64 `json:"released"`            // status=released (history retained)
+}

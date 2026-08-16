@@ -3,27 +3,30 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 	"visitor-parking/internal/model"
 )
 type Memory struct {
-	mu        sync.Mutex
-	residents map[string]*model.Resident
-	vehicles  map[string]*model.Vehicle
-	areas     map[string]*model.ParkingArea
-	auths     map[string]*model.Authorization
-	records   map[string]*model.EntryExitRecord
-	logs      map[string]*model.AuditLog
+	mu           sync.Mutex
+	residents    map[string]*model.Resident
+	vehicles     map[string]*model.Vehicle
+	areas        map[string]*model.ParkingArea
+	auths        map[string]*model.Authorization
+	records      map[string]*model.EntryExitRecord
+	restrictions map[string]*model.VehicleRestriction
+	logs         map[string]*model.AuditLog
 }
 func NewMemory() *Memory {
 	return &Memory{
-		residents: make(map[string]*model.Resident),
-		vehicles:  make(map[string]*model.Vehicle),
-		areas:     make(map[string]*model.ParkingArea),
-		auths:     make(map[string]*model.Authorization),
-		records:   make(map[string]*model.EntryExitRecord),
-		logs:      make(map[string]*model.AuditLog),
+		residents:    make(map[string]*model.Resident),
+		vehicles:     make(map[string]*model.Vehicle),
+		areas:        make(map[string]*model.ParkingArea),
+		auths:        make(map[string]*model.Authorization),
+		records:      make(map[string]*model.EntryExitRecord),
+		restrictions: make(map[string]*model.VehicleRestriction),
+		logs:         make(map[string]*model.AuditLog),
 	}
 }
 func clonePtr(t *time.Time) *time.Time {
@@ -259,19 +262,19 @@ func (m *Memory) ListParkingAreas(ctx context.Context, page model.Page) ([]*mode
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	return pageOf(out, page), int64(len(out)), nil
 }
-func (m *Memory) CreateAuthorization(ctx context.Context, a *model.Authorization, now time.Time) error {
+func (m *Memory) CreateAuthorization(ctx context.Context, a *model.Authorization, now time.Time, confirmer string) (*model.VehicleRestriction, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, ok := m.residents[a.ResidentID]
 	if !ok || r.ArchivedAt != nil {
-		return ErrNotFound
+		return nil, ErrNotFound
 	}
 	if r.Status != model.ResidentActive {
-		return ErrResidentDisabled
+		return nil, ErrResidentDisabled
 	}
 	area, ok := m.areas[a.ParkingAreaID]
 	if !ok || area.ArchivedAt != nil {
-		return ErrAreaArchived
+		return nil, ErrAreaArchived
 	}
 	for _, ex := range m.auths {
 		if ex.ArchivedAt != nil || ex.Plate != a.Plate {
@@ -281,11 +284,26 @@ func (m *Memory) CreateAuthorization(ctx context.Context, a *model.Authorization
 			continue
 		}
 		if a.StartTime.Before(ex.EndTime) && ex.StartTime.Before(a.EndTime) {
-			return ErrConflict
+			return nil, ErrConflict
+		}
+	}
+	// Restriction-list check against the authorization's validity window. Done
+	// under the same lock as the insert so the check and the create are atomic
+	// (no TOCTOU: a restriction added between check and insert is impossible).
+	matched := m.findActiveRestriction(a.Plate, a.StartTime, a.EndTime)
+	if matched != nil {
+		if matched.Type == model.RestrictionTypeForbidden {
+			return cloneRestriction(matched), ErrPlateForbidden
+		}
+		if strings.TrimSpace(confirmer) == "" {
+			return cloneRestriction(matched), ErrManualConfirmRequired
 		}
 	}
 	m.auths[a.ID] = cloneAuth(a)
-	return nil
+	if matched != nil {
+		return cloneRestriction(matched), nil
+	}
+	return nil, nil
 }
 func (m *Memory) GetAuthorization(ctx context.Context, id string) (*model.Authorization, error) {
 	m.mu.Lock()
@@ -458,25 +476,36 @@ func (m *Memory) AreaOccupancy(ctx context.Context) ([]*model.AreaOccupancy, err
 	sort.Slice(out, func(i, j int) bool { return out[i].Utilization > out[j].Utilization })
 	return out, nil
 }
-func (m *Memory) EnterVehicle(ctx context.Context, authID string, now time.Time) (*model.EntryExitRecord, error) {
+func (m *Memory) EnterVehicle(ctx context.Context, authID string, now time.Time, confirmer string) (*model.EntryExitRecord, *model.VehicleRestriction, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	a, ok := m.auths[authID]
 	if !ok || a.ArchivedAt != nil {
-		return nil, ErrNotFound
+		return nil, nil, ErrNotFound
 	}
 	if a.Status != model.AuthStatusPending {
 		if a.Status == model.AuthStatusActive {
-			return nil, ErrAlreadyEntered
+			return nil, nil, ErrAlreadyEntered
 		}
-		return nil, ErrStatusTransition
+		return nil, nil, ErrStatusTransition
 	}
 	if now.Before(a.StartTime) || !now.Before(a.EndTime) {
-		return nil, ErrOutOfTimeWindow
+		return nil, nil, ErrOutOfTimeWindow
+	}
+	// Restriction-list check at the entry instant, atomically with the record
+	// creation below (single mutex).
+	matched := m.findActiveRestriction(a.Plate, now, now)
+	if matched != nil {
+		if matched.Type == model.RestrictionTypeForbidden {
+			return nil, cloneRestriction(matched), ErrPlateForbidden
+		}
+		if strings.TrimSpace(confirmer) == "" {
+			return nil, cloneRestriction(matched), ErrManualConfirmRequired
+		}
 	}
 	area, ok := m.areas[a.ParkingAreaID]
 	if !ok || area.ArchivedAt != nil {
-		return nil, ErrAreaArchived
+		return nil, nil, ErrAreaArchived
 	}
 	occupied := 0
 	for _, rec := range m.records {
@@ -485,14 +514,17 @@ func (m *Memory) EnterVehicle(ctx context.Context, authID string, now time.Time)
 		}
 	}
 	if occupied >= area.Capacity {
-		return nil, ErrNoCapacity
+		return nil, nil, ErrNoCapacity
 	}
 	rec := &model.EntryExitRecord{ID: NewID("rec"), AuthorizationID: authID, Plate: a.Plate, ParkingAreaID: a.ParkingAreaID, EntryTime: now, Status: model.RecordStatusEntered, CreatedAt: now, UpdatedAt: now}
 	m.records[rec.ID] = cloneRecord(rec)
 	a.Status = model.AuthStatusActive
 	a.UpdatedAt = now
 	m.auths[authID] = cloneAuth(a)
-	return rec, nil
+	if matched != nil {
+		return rec, cloneRestriction(matched), nil
+	}
+	return rec, nil, nil
 }
 func (m *Memory) ExitVehicle(ctx context.Context, authID string, now time.Time, operator, note string) (*model.EntryExitRecord, error) {
 	m.mu.Lock()

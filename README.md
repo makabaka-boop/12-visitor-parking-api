@@ -46,6 +46,104 @@
   active 只能 exit，不能 revoke；completed/cancelled 为终态。
 ```
 
+## 车辆限制名单（迭代三）
+
+物业可登记禁止入场或需要人工确认的车牌，形成限制名单。创建授权与车辆入场时都会
+检查该名单：
+
+- **禁止入场（forbidden）**：直接拒绝（创建授权返回 403，入场返回 403）。
+- **人工确认（manual_confirm）**：请求必须提交 `confirmer`（确认人）字段；未提交
+  返回 400，提交后放行并审计确认人。
+
+检查规则：
+
+- 创建授权时按**授权有效窗口** `[start_time, end_time)` 与限制窗口 `[effective_from,
+  effective_to)` 做重叠判断；入场时按**入场时刻**做点判定（半开区间
+  `[effective_from, effective_to)`）。
+- 同一车牌存在多条生效限制时，`forbidden` 优先于 `manual_confirm`。
+- 解除限制（release）将状态置为 `released`，**历史记录保留**，不删除；解除后该车牌
+  不再受限。归档（archive）为软删除。
+- 同一车牌在相同时间范围内不得存在重复的生效记录（重叠 → 409）。
+- 失效时间必须晚于生效时间（`effective_to > effective_from`）。
+- 所有检查结果（拒绝 / 需确认 / 已确认）与状态变化（创建 / 修改 / 解除 / 归档）均写入
+  审计日志，`confirmer` 随人工确认一并审计。
+
+限制状态：
+
+```
+active ──release──▶ released   （解除，历史保留）
+active/released ──archive──▶ 软归档（archived_at）
+```
+
+并发可靠：内存实现用全局互斥锁，PostgreSQL 用 `SERIALIZABLE` 事务 + `FOR UPDATE`，
+限制检查与授权创建 / 入场在同一临界区内完成，避免 TOCTOU。
+
+### 创建限制（物业）
+
+```bash
+# 禁止入场
+curl -s -X POST localhost:8117/api/v1/restrictions \
+  -H 'Content-Type: application/json' \
+  -d '{"plate":"京X12345","type":"forbidden",
+       "effective_from":"2026-08-16T00:00:00Z","effective_to":"2026-08-17T00:00:00Z",
+       "reason":"违规车辆","registered_by":"manager1"}'
+# → data.id = rstr_..., status=active
+
+# 人工确认
+curl -s -X POST localhost:8117/api/v1/restrictions \
+  -H 'Content-Type: application/json' \
+  -d '{"plate":"京Y54321","type":"manual_confirm",
+       "effective_from":"2026-08-16T00:00:00Z","effective_to":"2026-08-17T00:00:00Z",
+       "reason":"需核实","registered_by":"manager1"}'
+```
+
+### 受限车牌创建授权 / 入场
+
+```bash
+# 京X12345 被禁止 → 创建授权直接 403
+curl -s -X POST localhost:8117/api/v1/authorizations \
+  -H 'Content-Type: application/json' \
+  -d '{"resident_id":"res_...","parking_area_id":"area_...","plate":"京X12345",
+       "start_time":"2026-08-16T10:00:00Z","end_time":"2026-08-16T18:00:00Z"}'
+
+# 京Y54321 需人工确认 → 须带 confirmer，否则 400
+curl -s -X POST localhost:8117/api/v1/authorizations \
+  -H 'Content-Type: application/json' \
+  -d '{"resident_id":"res_...","parking_area_id":"area_...","plate":"京Y54321",
+       "start_time":"2026-08-16T10:00:00Z","end_time":"2026-08-16T18:00:00Z",
+       "confirmer":"guard2"}'
+
+# 入场同理，body 可带 confirmer
+curl -s -X POST localhost:8117/api/v1/authorizations/auth_.../entry \
+  -H 'Content-Type: application/json' -d '{"confirmer":"guard2"}'
+```
+
+### 解除限制（保留历史）
+
+```bash
+curl -s -X POST localhost:8117/api/v1/restrictions/rstr_.../release \
+  -H 'Content-Type: application/json' \
+  -d '{"operator":"manager1","reason":"误登，已核实"}'
+# → data.status=released，记录仍可在列表中查到
+```
+
+### 限制名单筛选与统计
+
+```bash
+curl -s 'localhost:8117/api/v1/restrictions?plate=京X12345&type=forbidden&status=active'
+curl -s 'localhost:8117/api/v1/restrictions?status=active&effective_on=2026-08-16T12:00:00Z'
+curl -s 'localhost:8117/api/v1/stats/restrictions'
+# → {"total_active":2,"currently_in_effect":2,"forbidden":1,"manual_confirm":1,"released":0}
+```
+
+### 限制名单审计
+
+```bash
+curl -s 'localhost:8117/api/v1/audit-logs?entity_type=restriction'
+# 含 restriction.create / restriction.update / restriction.release / restriction.archive /
+# restriction.check（forbidden 拒绝 / 需确认 / 已确认 by confirmer）
+```
+
 ## 快速开始
 
 ### 本地运行（内存存储，无需数据库）
@@ -157,6 +255,10 @@ go vet ./...                   # 静态检查
 | GET | `/api/v1/stats/today-arrivals` | 今日预计到访 |
 | GET | `/api/v1/stats/expiring-soon` | 即将过期授权（6h 内） |
 | GET | `/api/v1/stats/occupancy` | 各区域占用率 |
+| GET | `/api/v1/stats/restrictions` | 当前限制名单统计 |
+| POST/GET | `/api/v1/restrictions` | 创建限制 / 组合筛选列表 |
+| GET/PUT/DELETE | `/api/v1/restrictions/{id}` | 详情 / 更新(需 updated_at) / 软归档 |
+| POST | `/api/v1/restrictions/{id}/release` | 解除限制（保留历史） |
 | GET | `/api/v1/audit-logs` | 审计日志（entity_type 筛选） |
 
 ### 授权列表筛选（query string）
@@ -168,6 +270,10 @@ curl -s 'localhost:8117/api/v1/authorizations?building=1栋&status=pending&limit
 curl -s 'localhost:8117/api/v1/stats/occupancy'
 ```
 
+### 限制名单筛选（query string）
+
+`plate`、`type`(`forbidden`/`manual_confirm`)、`status`(`active`/`released`)、`registered_by`、`effective_on`(RFC3339，该时刻生效中的记录)、`limit`、`offset`，结果按 `effective_from` 降序。
+
 ## 创建授权校验规则
 
 - 住户存在且状态为 `active`（已停用 → 400）
@@ -176,6 +282,7 @@ curl -s 'localhost:8117/api/v1/stats/occupancy'
 - `end_time` 晚于 `start_time`
 - 单次时长 ≤ 7 天
 - 同一车牌在重叠时间内只能存在一条有效授权（pending/active），冲突 → 409
+- 受限制名单约束：`forbidden` 车牌 → 403；`manual_confirm` 车牌须带 `confirmer`，否则 400（见「车辆限制名单」）
 
 ## Docker
 
@@ -216,4 +323,4 @@ go test ./... -v        # 服务层 + HTTP 层，内存存储，无外部依赖
 go test -race ./...     # 竞态检测
 ```
 
-覆盖：创建授权全部校验规则、重叠冲突、入场/离场状态迁移、容量限制、重复入场/离场冲突、撤销前置状态、更新并发冲突、统计接口、软删除、统一错误响应与校验明细。
+覆盖：创建授权全部校验规则、重叠冲突、入场/离场状态迁移、容量限制、重复入场/离场冲突、撤销前置状态、更新并发冲突、统计接口、软删除、统一错误响应与校验明细，以及限制名单的创建校验、重叠冲突、授权/入场集成（forbidden 拒绝 / manual_confirm 需确认人）、解除保留历史、归档、组合筛选、统计与并发安全。

@@ -2,6 +2,7 @@ package httpd
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"visitor-parking/internal/service"
@@ -63,6 +64,12 @@ func writeErr(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrAreaArchived):
 		status = http.StatusBadRequest
 		body.Message = "parking area is archived"
+	case errors.Is(err, store.ErrPlateForbidden):
+		status = http.StatusForbidden
+		body.Message = "vehicle is forbidden from entering"
+	case errors.Is(err, store.ErrManualConfirmRequired):
+		status = http.StatusBadRequest
+		body.Message = "vehicle requires manual confirmation; provide confirmer"
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -75,6 +82,9 @@ func decodeJSON(r *http.Request, v interface{}) error {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil // empty body is valid for optional-body endpoints (e.g. entry)
+		}
 		return service.NewFieldError("body", err.Error())
 	}
 	return nil

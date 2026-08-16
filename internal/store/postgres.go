@@ -225,8 +225,9 @@ func (p *Postgres) ListParkingAreas(ctx context.Context, page model.Page) ([]*mo
 	return out, total, rows.Err()
 }
 const authCols = "id,resident_id,plate,parking_area_id,start_time,end_time,status,purpose,created_by,archived_at,created_at,updated_at"
-func (p *Postgres) CreateAuthorization(ctx context.Context, a *model.Authorization, now time.Time) error {
-	return p.runTx(ctx, func(ctx context.Context) error {
+func (p *Postgres) CreateAuthorization(ctx context.Context, a *model.Authorization, now time.Time, confirmer string) (*model.VehicleRestriction, error) {
+	var matched *model.VehicleRestriction
+	err := p.runTx(ctx, func(ctx context.Context) error {
 		var status string
 		if err := p.q(ctx).QueryRowContext(ctx, `SELECT status FROM residents WHERE id=$1 AND archived_at IS NULL`, a.ResidentID).Scan(&status); err != nil {
 			return mapNotFound(err)
@@ -248,10 +249,29 @@ func (p *Postgres) CreateAuthorization(ctx context.Context, a *model.Authorizati
 		if n > 0 {
 			return ErrConflict
 		}
-		_, err := p.q(ctx).ExecContext(ctx, `INSERT INTO authorizations (`+authCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		// Restriction-list check against the authorization's validity window,
+		// inside the same serializable transaction as the insert.
+		r, err := p.lockedRestriction(ctx, a.Plate, a.StartTime, a.EndTime)
+		if err != nil {
+			return err
+		}
+		matched = r
+		if matched != nil {
+			if matched.Type == model.RestrictionTypeForbidden {
+				return ErrPlateForbidden
+			}
+			if strings.TrimSpace(confirmer) == "" {
+				return ErrManualConfirmRequired
+			}
+		}
+		_, err = p.q(ctx).ExecContext(ctx, `INSERT INTO authorizations (`+authCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
 			a.ID, a.ResidentID, a.Plate, a.ParkingAreaID, a.StartTime, a.EndTime, a.Status, a.Purpose, a.CreatedBy, a.ArchivedAt, a.CreatedAt, a.UpdatedAt)
 		return err
 	})
+	if err != nil {
+		return matched, err
+	}
+	return matched, nil
 }
 func (p *Postgres) GetAuthorization(ctx context.Context, id string) (*model.Authorization, error) {
 	a := &model.Authorization{}
@@ -433,8 +453,9 @@ func (p *Postgres) AreaOccupancy(ctx context.Context) ([]*model.AreaOccupancy, e
 	}
 	return out, rows.Err()
 }
-func (p *Postgres) EnterVehicle(ctx context.Context, authID string, now time.Time) (*model.EntryExitRecord, error) {
+func (p *Postgres) EnterVehicle(ctx context.Context, authID string, now time.Time, confirmer string) (*model.EntryExitRecord, *model.VehicleRestriction, error) {
 	var rec *model.EntryExitRecord
+	var matched *model.VehicleRestriction
 	err := p.runTx(ctx, func(ctx context.Context) error {
 		var plate, areaID string
 		var start, end time.Time
@@ -453,6 +474,21 @@ func (p *Postgres) EnterVehicle(ctx context.Context, authID string, now time.Tim
 		if now.Before(start) || !now.Before(end) {
 			return ErrOutOfTimeWindow
 		}
+		// Restriction-list check at the entry instant, inside the same
+		// serializable transaction as the record insert.
+		r, err := p.lockedRestriction(ctx, plate, now, now)
+		if err != nil {
+			return err
+		}
+		matched = r
+		if matched != nil {
+			if matched.Type == model.RestrictionTypeForbidden {
+				return ErrPlateForbidden
+			}
+			if strings.TrimSpace(confirmer) == "" {
+				return ErrManualConfirmRequired
+			}
+		}
 		var capacity, occupied int
 		if err := p.q(ctx).QueryRowContext(ctx, `SELECT capacity,COALESCE((SELECT count(*) FROM entry_exit_records r WHERE r.parking_area_id=p.id AND r.status='entered'),0) FROM parking_areas p WHERE id=$1 AND archived_at IS NULL FOR UPDATE`, areaID).Scan(&capacity, &occupied); err != nil {
 			return mapNotFound(err)
@@ -467,7 +503,10 @@ func (p *Postgres) EnterVehicle(ctx context.Context, authID string, now time.Tim
 		_, err = p.q(ctx).ExecContext(ctx, `UPDATE authorizations SET status='active',updated_at=$1 WHERE id=$2`, now, authID)
 		return err
 	})
-	return rec, err
+	if err != nil {
+		return nil, matched, err
+	}
+	return rec, matched, nil
 }
 func (p *Postgres) ExitVehicle(ctx context.Context, authID string, now time.Time, operator, note string) (*model.EntryExitRecord, error) {
 	var recID string

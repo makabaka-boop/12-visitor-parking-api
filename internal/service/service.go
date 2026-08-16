@@ -283,6 +283,7 @@ type CreateAuthorizationInput struct {
 	EndTime       time.Time `json:"end_time"`
 	Purpose       string    `json:"purpose"`
 	CreatedBy     string    `json:"created_by"`
+	Confirmer     string    `json:"confirmer"` // required only when the plate is under a manual_confirm restriction
 }
 func (s *Service) CreateAuthorization(ctx context.Context, in CreateAuthorizationInput) (*model.Authorization, error) {
 	now := s.nowT()
@@ -315,7 +316,11 @@ func (s *Service) CreateAuthorization(ctx context.Context, in CreateAuthorizatio
 		CreatedAt:     now,
 		UpdatedAt:     now,
 	}
-	if err := s.store.CreateAuthorization(ctx, a, now); err != nil {
+	matched, err := s.store.CreateAuthorization(ctx, a, now, strings.TrimSpace(in.Confirmer))
+	if matched != nil {
+		s.auditRestrictionCheck(ctx, "authorization.create", a.Plate, defStr(strings.TrimSpace(in.Confirmer), a.CreatedBy), matched, strings.TrimSpace(in.Confirmer), err)
+	}
+	if err != nil {
 		return nil, err
 	}
 	s.audit(ctx, "authorization.create", "authorization", a.ID, a.CreatedBy, "authorization created")
@@ -412,13 +417,23 @@ type ListAuthFilter struct {
 	ExpiringSoon  bool
 	Limit, Offset int
 }
-func (s *Service) EnterVehicle(ctx context.Context, authID string) (*model.EntryExitRecord, error) {
+func (s *Service) EnterVehicle(ctx context.Context, authID, confirmer string) (*model.EntryExitRecord, error) {
 	now := s.nowT()
-	rec, err := s.store.EnterVehicle(ctx, authID, now)
+	confirmer = strings.TrimSpace(confirmer)
+	rec, matched, err := s.store.EnterVehicle(ctx, authID, now, confirmer)
+	if matched != nil {
+		plate := ""
+		if rec != nil {
+			plate = rec.Plate
+		} else if matched != nil {
+			plate = matched.Plate
+		}
+		s.auditRestrictionCheck(ctx, "entry", plate, defStr(confirmer, "gate"), matched, confirmer, err)
+	}
 	if err != nil {
 		return nil, err
 	}
-	s.audit(ctx, "entry.record", "record", rec.ID, "gate", fmt.Sprintf("vehicle %s entered area %s", rec.Plate, rec.ParkingAreaID))
+	s.audit(ctx, "entry.record", "record", rec.ID, defStr(confirmer, "gate"), fmt.Sprintf("vehicle %s entered area %s", rec.Plate, rec.ParkingAreaID))
 	return rec, nil
 }
 type ExitRequest struct {

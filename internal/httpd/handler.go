@@ -43,6 +43,13 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/stats/today-arrivals", h.todayArrivals)
 	mux.HandleFunc("GET /api/v1/stats/expiring-soon", h.expiringSoon)
 	mux.HandleFunc("GET /api/v1/stats/occupancy", h.occupancy)
+	mux.HandleFunc("GET /api/v1/stats/restrictions", h.restrictionStats)
+	mux.HandleFunc("POST /api/v1/restrictions", h.createRestriction)
+	mux.HandleFunc("GET /api/v1/restrictions", h.listRestrictions)
+	mux.HandleFunc("GET /api/v1/restrictions/{id}", h.getRestriction)
+	mux.HandleFunc("PUT /api/v1/restrictions/{id}", h.updateRestriction)
+	mux.HandleFunc("DELETE /api/v1/restrictions/{id}", h.archiveRestriction)
+	mux.HandleFunc("POST /api/v1/restrictions/{id}/release", h.releaseRestriction)
 	mux.HandleFunc("GET /api/v1/audit-logs", h.listAuditLogs)
 	return mux
 }
@@ -278,7 +285,12 @@ func (h *Handler) revokeAuth(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, http.StatusOK, a)
 }
 func (h *Handler) entry(w http.ResponseWriter, r *http.Request) {
-	rec, err := h.svc.EnterVehicle(r.Context(), r.PathValue("id"))
+	var in service.EntryRequest
+	if err := decodeJSON(r, &in); err != nil {
+		writeErr(w, err)
+		return
+	}
+	rec, err := h.svc.EnterVehicle(r.Context(), r.PathValue("id"), in.Confirmer)
 	if err != nil {
 		writeErr(w, err)
 		return
